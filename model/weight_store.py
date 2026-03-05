@@ -1,0 +1,236 @@
+"""Tier 8 — The Long Term Weight Store (Persistent Brain State).
+
+Saves and loads the complete brain state between sessions.
+Uses numpy's npz format for efficient serialisation of weight matrices.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import tempfile
+
+import numpy as np
+import torch
+
+from .genome import Genome, LayerTopology
+from .tensor import DTYPE, get_device
+from .types_ import BrainState, CortexRegion, MoodState, PersonalityVector
+
+
+class WeightStore:
+    """Persistent storage for the brain state."""
+
+    def __init__(self, storage_dir: str | Path) -> None:
+        self._dir = Path(storage_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._weights_path = self._dir / "brain_weights.pt"
+        self._legacy_weights_path = self._dir / "brain_weights.npz"  # backward compat
+        self._meta_path = self._dir / "brain_meta.json"
+
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+
+    def load_topology(self) -> LayerTopology | None:
+        """Return the LayerTopology stored in the most recent save, or None."""
+        if not self._meta_path.exists():
+            return None
+        try:
+            meta = json.loads(self._meta_path.read_text())
+            topo_data = meta.get("topology")
+            if topo_data is None:
+                return None
+            return LayerTopology(
+                vocab_size=topo_data.get("vocab_size", 30000),
+                embed_dim=topo_data.get("embed_dim", 64),
+                brainstem_hidden=topo_data.get("brainstem_hidden", 128),
+                cortex_hidden=topo_data.get("cortex_hidden", 128),
+                hippocampus_capacity=topo_data.get("hippocampus_capacity", 1024),
+            )
+        except Exception:
+            return None
+
+    def save(self, state: BrainState, genome: Genome | None = None) -> None:
+        """Persist the complete brain state to disk."""
+        tensors: dict[str, torch.Tensor] = {}
+
+        # Brainstem weights
+        for name, arr in state.brainstem_weights.items():
+            tensors[f"brainstem_{name}"] = arr.detach().cpu()
+
+        # Cortex weights
+        for region, arr in state.cortex_weights.items():
+            tensors[f"cortex_{region.value}"] = arr.detach().cpu()
+
+        # Inter-region weights
+        for (r1, r2), arr in state.inter_region_weights.items():
+            tensors[f"interregion_{r1.value}_{r2.value}"] = arr.detach().cpu()
+
+        # EWC protection scalars
+        for region, arr in state.ewc_protection.items():
+            tensors[f"ewc_{region.value}"] = arr.detach().cpu()
+
+        # Plasticity rates as tensor
+        if state.plasticity_rates:
+            keys = sorted(state.plasticity_rates.keys(), key=lambda r: r.value)
+            tensors["plasticity_values"] = torch.tensor(
+                [state.plasticity_rates[k] for k in keys], dtype=torch.float64,
+            )
+
+        # Write atomically; torch.save is much faster than np.savez_compressed
+        # for large tensors (no zlib overhead).
+        with tempfile.NamedTemporaryFile(
+            dir=str(self._dir), prefix="brain_weights_", suffix=".pt", delete=False,
+        ) as tmp:
+            tmp_weights_path = Path(tmp.name)
+        try:
+            torch.save(tensors, str(tmp_weights_path))
+            os.replace(str(tmp_weights_path), str(self._weights_path))
+        finally:
+            if tmp_weights_path.exists():
+                os.remove(tmp_weights_path)
+
+        # Metadata (JSON-serialisable)
+        meta: dict = {
+            "personality": {
+                name: getattr(state.personality, name)
+                for name in PersonalityVector.TRAIT_NAMES
+            },
+            "mood_baseline": {
+                "valence": state.mood_baseline.valence,
+                "arousal": state.mood_baseline.arousal,
+                "openness": state.mood_baseline.openness,
+            },
+            "developmental_age": state.developmental_age,
+            "plasticity_rate_keys": [r.value for r in sorted(
+                state.plasticity_rates.keys(), key=lambda r: r.value,
+            )] if state.plasticity_rates else [],
+            "consolidation_meta": state.consolidation_meta,
+            "inter_region_highway": {
+                f"{r1.value}_{r2.value}": v
+                for (r1, r2), v in state.inter_region_highway.items()
+            },
+        }
+
+        # Persist topology so the server can reload with matching dimensions.
+        if genome is not None:
+            t = genome.topology
+            meta["topology"] = {
+                "vocab_size": t.vocab_size,
+                "embed_dim": t.embed_dim,
+                "brainstem_hidden": t.brainstem_hidden,
+                "cortex_hidden": t.cortex_hidden,
+                "hippocampus_capacity": t.hippocampus_capacity,
+            }
+
+        with tempfile.NamedTemporaryFile(
+            dir=str(self._dir), prefix="brain_meta_", suffix=".json", mode="w", delete=False,
+        ) as tmp_meta:
+            tmp_meta_path = Path(tmp_meta.name)
+            json.dump(meta, tmp_meta, indent=2)
+        try:
+            os.replace(str(tmp_meta_path), str(self._meta_path))
+        finally:
+            if tmp_meta_path.exists():
+                os.remove(tmp_meta_path)
+
+    # ------------------------------------------------------------------
+    # Load
+    # ------------------------------------------------------------------
+
+    def load(self) -> BrainState | None:
+        """Load brain state from disk. Returns None if no save exists."""
+        if not self._meta_path.exists():
+            return None
+        if not self._weights_path.exists() and not self._legacy_weights_path.exists():
+            return None
+
+        try:
+            with open(self._meta_path, "r") as f:
+                meta = json.load(f)
+
+            state = BrainState()
+
+            # Load tensors — prefer new .pt format, fall back to legacy .npz
+            if self._weights_path.exists():
+                raw = torch.load(
+                    str(self._weights_path), map_location="cpu", weights_only=True,
+                )
+                data_items = {k: v.to(dtype=DTYPE, device=get_device()) for k, v in raw.items()}
+            else:
+                with np.load(str(self._legacy_weights_path), allow_pickle=False) as npz:
+                    data_items = {
+                        k: torch.as_tensor(npz[k], dtype=DTYPE, device=get_device())
+                        for k in npz.files
+                    }
+
+            rate_keys = meta.get("plasticity_rate_keys", [])
+            for key, tensor in data_items.items():
+                if key.startswith("brainstem_"):
+                    state.brainstem_weights[key[len("brainstem_"):]] = tensor
+                elif key.startswith("cortex_"):
+                    state.cortex_weights[CortexRegion(key[len("cortex_"):])] = tensor
+                elif key.startswith("interregion_"):
+                    parts = key[len("interregion_"):].split("_", 1)
+                    if len(parts) == 2:
+                        state.inter_region_weights[
+                            (CortexRegion(parts[0]), CortexRegion(parts[1]))
+                        ] = tensor
+                elif key.startswith("ewc_"):
+                    state.ewc_protection[CortexRegion(key[len("ewc_"):])] = tensor
+                elif key == "plasticity_values":
+                    for i, key_name in enumerate(rate_keys):
+                        if i < tensor.numel():
+                            state.plasticity_rates[CortexRegion(key_name)] = float(tensor[i].item())
+
+            # Personality
+            p = meta.get("personality", {})
+            state.personality = PersonalityVector(
+                curiosity=p.get("curiosity", 0.5),
+                warmth=p.get("warmth", 0.5),
+                assertiveness=p.get("assertiveness", 0.5),
+                creativity=p.get("creativity", 0.5),
+                caution=p.get("caution", 0.5),
+                humor=p.get("humor", 0.5),
+            )
+
+            # Mood baseline
+            m = meta.get("mood_baseline", {})
+            state.mood_baseline = MoodState(
+                valence=m.get("valence", 0.0),
+                arousal=m.get("arousal", 0.2),
+                openness=m.get("openness", 0.5),
+            )
+
+            state.developmental_age = meta.get("developmental_age", 0)
+            state.consolidation_meta = meta.get("consolidation_meta", {})
+
+            highway = meta.get("inter_region_highway", {})
+            for key_str, val in highway.items():
+                parts = key_str.split("_", 1)
+                if len(parts) == 2:
+                    state.inter_region_highway[
+                        (CortexRegion(parts[0]), CortexRegion(parts[1]))
+                    ] = float(val)
+
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load brain state from '{self._weights_path}': {exc}"
+            ) from exc
+
+        return state
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+
+    def exists(self) -> bool:
+        weights_exist = self._weights_path.exists() or self._legacy_weights_path.exists()
+        return weights_exist and self._meta_path.exists()
+
+    def delete(self) -> None:
+        for path in (self._weights_path, self._legacy_weights_path, self._meta_path):
+            if path.exists():
+                os.remove(path)

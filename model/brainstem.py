@@ -1,0 +1,229 @@
+"""Tier 1 — The Brainstem (Frozen Prior Layer).
+
+Trained during pretraining.  A few thousand Hebbian steps.  Never touched again.
+Takes raw token IDs and produces structured representations for higher layers.
+
+Encodes:
+  - Token co-occurrence primitives
+  - Basic syntactic structure
+  - Fundamental attention primitives
+  - Sequence directionality
+  - Basic cause/effect linking
+
+Does NOT encode facts, concepts, or semantic meaning.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from .genome import Genome
+from .tensor import DTYPE, get_device
+from .types_ import StructuredRepresentation
+
+
+class Brainstem:
+    """Frozen prior layer that converts raw tokens into structured representations."""
+
+    def __init__(self, genome: Genome, rng: object | None = None) -> None:
+        self._genome = genome
+        self._device = get_device()
+        topo = genome.topology
+
+        # Learnable (during pretrain only) weight matrices
+        self.token_embeddings = torch.randn(
+            (topo.vocab_size, topo.embed_dim), dtype=DTYPE, device=self._device,
+        ) * 0.02
+
+        self.cooccurrence_weights = torch.randn(
+            (topo.embed_dim, topo.brainstem_hidden), dtype=DTYPE, device=self._device,
+        ) * 0.02
+
+        self.syntax_weights = torch.randn(
+            (topo.brainstem_hidden, topo.brainstem_hidden), dtype=DTYPE, device=self._device,
+        ) * 0.02
+
+        self.attention_query = torch.randn(
+            (topo.brainstem_hidden, topo.embed_dim), dtype=DTYPE, device=self._device,
+        ) * 0.02
+
+        self.attention_key = torch.randn(
+            (topo.brainstem_hidden, topo.embed_dim), dtype=DTYPE, device=self._device,
+        ) * 0.02
+
+        self.output_projection = torch.randn(
+            (topo.brainstem_hidden, topo.embed_dim), dtype=DTYPE, device=self._device,
+        ) * 0.02
+
+        self._frozen = False
+
+    # ------------------------------------------------------------------
+    # Pretraining
+    # ------------------------------------------------------------------
+
+    def pretrain(self, token_sequences: list[torch.Tensor]) -> None:
+        """Run Hebbian pretraining on a corpus of token sequences.
+
+        Each sequence is a 1-D array of token IDs.  We do genome.generation.
+        brainstem_pretrain_steps Hebbian updates across the sequences.
+        """
+        params = self._genome.hebbian
+        steps = self._genome.generation.brainstem_pretrain_steps
+        n_seqs = len(token_sequences)
+        if n_seqs == 0:
+            self._frozen = True
+            return
+
+        try:
+            from tqdm import trange
+        except Exception:
+            trange = range
+
+        for step in trange(steps, desc="Brainstem pretrain", leave=False):
+            seq = token_sequences[step % n_seqs]
+            if len(seq) < 2:
+                continue
+
+            seq = seq.to(device=self._device, dtype=torch.long)
+            embeddings = self.token_embeddings[seq]  # (seq_len, embed_dim)
+            hidden = self._relu(embeddings @ self.cooccurrence_weights)  # (seq_len, brainstem_hidden)
+            syntactic = self._relu(hidden @ self.syntax_weights)  # (seq_len, brainstem_hidden)
+
+            # Hebbian update: Δw = η · pre^T · post  (averaged over sequence)
+            lr = params.learning_rate
+            seq_len = len(seq)
+
+            # Co-occurrence weights
+            delta_co = (embeddings.T @ hidden) / seq_len
+            self.cooccurrence_weights += lr * delta_co
+            self.cooccurrence_weights.clamp_(params.min_weight, params.max_weight)
+
+            # Syntax weights
+            delta_syn = (hidden.T @ syntactic) / seq_len
+            self.syntax_weights += lr * delta_syn
+            self.syntax_weights.clamp_(params.min_weight, params.max_weight)
+
+            # Embedding update via reconstruction error signal
+            reconstructed = syntactic @ self.output_projection  # (seq_len, embed_dim)
+            error = embeddings - reconstructed
+            delta_emb = (syntactic.T @ error) / seq_len
+            self.output_projection += lr * 0.5 * delta_emb
+            self.output_projection.clamp_(params.min_weight, params.max_weight)
+
+            # Attention weight update via co-activation of Q and K
+            Q = syntactic @ self.attention_query  # (seq_len, embed_dim)
+            K = syntactic @ self.attention_key
+            delta_q = (syntactic.T @ Q) / seq_len
+            delta_k = (syntactic.T @ K) / seq_len
+            self.attention_query += lr * 0.3 * delta_q
+            self.attention_key += lr * 0.3 * delta_k
+            self.attention_query.clamp_(params.min_weight, params.max_weight)
+            self.attention_key.clamp_(params.min_weight, params.max_weight)
+
+        self._frozen = True
+
+    def freeze(self) -> None:
+        self._frozen = True
+
+    @property
+    def is_frozen(self) -> bool:
+        return self._frozen
+
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
+
+    def process(self, token_ids: torch.Tensor) -> StructuredRepresentation:
+        """Convert raw token IDs into a structured representation.
+
+        Args:
+            token_ids: 1-D int array of token IDs.
+
+        Returns:
+            StructuredRepresentation ready for the limbic gate.
+        """
+        token_ids = token_ids.to(device=self._device, dtype=torch.long)
+        seq_len = int(token_ids.shape[0])
+        topo = self._genome.topology
+
+        # Embed
+        embeddings = self.token_embeddings[token_ids]  # (seq_len, embed_dim)
+
+        # Positional encoding — sinusoidal
+        pos_enc = self._positional_encoding(seq_len, topo.embed_dim)
+
+        # Hidden representations via co-occurrence and syntax layers
+        hidden = self._relu(embeddings @ self.cooccurrence_weights)
+        syntactic = self._relu(hidden @ self.syntax_weights)
+
+        # Self-attention: Q, K from syntactic; V = syntactic projected
+        Q = syntactic @ self.attention_query   # (seq_len, embed_dim)
+        K = syntactic @ self.attention_key     # (seq_len, embed_dim)
+        scale = float(topo.embed_dim) ** 0.5
+        attn_logits = (Q @ K.T) / scale        # (seq_len, seq_len)
+
+        # Causal mask — sequence directionality (language moves forward)
+        causal_mask = torch.triu(
+            torch.ones((seq_len, seq_len), dtype=DTYPE, device=self._device),
+            diagonal=1,
+        ) * -1e9
+        attn_logits += causal_mask
+
+        attn_weights = self._softmax(attn_logits, axis=-1)
+
+        # Final structured output projected back to embed_dim
+        context = attn_weights @ syntactic     # (seq_len, brainstem_hidden)
+        projected = context @ self.output_projection  # (seq_len, embed_dim)
+
+        return StructuredRepresentation(
+            token_ids=token_ids,
+            embeddings=projected + pos_enc,
+            positional_encoding=pos_enc,
+            attention_weights=attn_weights,
+        )
+
+    # ------------------------------------------------------------------
+    # Weight I/O
+    # ------------------------------------------------------------------
+
+    def get_weights(self) -> dict[str, torch.Tensor]:
+        return {
+            "token_embeddings": self.token_embeddings.detach().clone(),
+            "cooccurrence_weights": self.cooccurrence_weights.detach().clone(),
+            "syntax_weights": self.syntax_weights.detach().clone(),
+            "attention_query": self.attention_query.detach().clone(),
+            "attention_key": self.attention_key.detach().clone(),
+            "output_projection": self.output_projection.detach().clone(),
+        }
+
+    def load_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        for name, arr in weights.items():
+            current = getattr(self, name, None)
+            if current is not None and current.shape == arr.shape:
+                setattr(self, name, arr.to(device=self._device, dtype=DTYPE).clone())
+        self._frozen = True
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _relu(x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(x)
+
+    @staticmethod
+    def _softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
+        shifted = x - x.max(dim=axis, keepdim=True).values
+        exp = torch.exp(shifted)
+        return exp / (exp.sum(dim=axis, keepdim=True) + 1e-12)
+
+    @staticmethod
+    def _positional_encoding(seq_len: int, dim: int) -> torch.Tensor:
+        pos = torch.arange(seq_len, dtype=DTYPE, device=get_device()).unsqueeze(1)
+        i = torch.arange(dim, dtype=DTYPE, device=get_device()).unsqueeze(0)
+        angle_rates = 1.0 / torch.pow(torch.tensor(10000.0, dtype=DTYPE, device=get_device()), (2 * torch.floor(i / 2)) / dim)
+        angles = pos * angle_rates
+        # sin on even indices, cos on odd
+        angles[:, 0::2] = torch.sin(angles[:, 0::2])
+        angles[:, 1::2] = torch.cos(angles[:, 1::2])
+        return angles

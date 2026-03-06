@@ -16,7 +16,7 @@ import torch
 
 from .genome import Genome, LayerTopology
 from .tensor import DTYPE, get_device
-from .types_ import BrainState, CortexRegion, MoodState, PersonalityVector
+from .types_ import BrainState, CortexRegion, MoodState, NeuromodulatorState, PersonalityVector
 
 
 class WeightStore:
@@ -79,6 +79,26 @@ class WeightStore:
                 [state.plasticity_rates[k] for k in keys], dtype=torch.float64,
             )
 
+        # Thalamus weights
+        if state.thalamus_weights:
+            for name, arr in state.thalamus_weights.items():
+                tensors[f"thalamus_{name}"] = arr.detach().cpu()
+
+        # Cerebellum weights
+        if state.cerebellum_weights:
+            for name, arr in state.cerebellum_weights.items():
+                tensors[f"cerebellum_{name}"] = arr.detach().cpu()
+
+        # Astrocyte usage counters
+        if state.astrocyte_usage:
+            for region, arr in state.astrocyte_usage.items():
+                tensors[f"astrocyte_{region.value}"] = arr.detach().cpu()
+
+        # Cortex predictions (predictive coding)
+        if state.cortex_predictions:
+            for region, arr in state.cortex_predictions.items():
+                tensors[f"cortexpred_{region.value}"] = arr.detach().cpu()
+
         # Write atomically; torch.save is much faster than np.savez_compressed
         # for large tensors (no zlib overhead).
         with tempfile.NamedTemporaryFile(
@@ -113,6 +133,26 @@ class WeightStore:
                 for (r1, r2), v in state.inter_region_highway.items()
             },
         }
+
+        # Neuromodulator baseline
+        if state.neuromodulator_baseline is not None:
+            nm = state.neuromodulator_baseline
+            meta["neuromodulator_baseline"] = {
+                "dopamine": nm.dopamine,
+                "serotonin": nm.serotonin,
+                "acetylcholine": nm.acetylcholine,
+                "norepinephrine": nm.norepinephrine,
+            }
+
+        # Habit store (basal ganglia) — convert tensor contexts to JSON-serialisable lists
+        if state.habit_store is not None:
+            serialisable_habits = []
+            for h in state.habit_store.get("habits", []):
+                entry = dict(h)
+                if isinstance(entry.get("context"), torch.Tensor):
+                    entry["context"] = entry["context"].detach().cpu().tolist()
+                serialisable_habits.append(entry)
+            meta["habit_store"] = {"habits": serialisable_habits}
 
         # Persist topology so the server can reload with matching dimensions.
         if genome is not None:
@@ -180,6 +220,20 @@ class WeightStore:
                         ] = tensor
                 elif key.startswith("ewc_"):
                     state.ewc_protection[CortexRegion(key[len("ewc_"):])] = tensor
+                elif key.startswith("thalamus_"):
+                    state.thalamus_weights[key[len("thalamus_"):]] = tensor
+                elif key.startswith("cerebellum_"):
+                    state.cerebellum_weights[key[len("cerebellum_"):]] = tensor
+                elif key.startswith("astrocyte_"):
+                    try:
+                        state.astrocyte_usage[CortexRegion(key[len("astrocyte_"):])] = tensor
+                    except ValueError:
+                        pass
+                elif key.startswith("cortexpred_"):
+                    try:
+                        state.cortex_predictions[CortexRegion(key[len("cortexpred_"):])] = tensor
+                    except ValueError:
+                        pass
                 elif key == "plasticity_values":
                     for i, key_name in enumerate(rate_keys):
                         if i < tensor.numel():
@@ -214,6 +268,26 @@ class WeightStore:
                     state.inter_region_highway[
                         (CortexRegion(parts[0]), CortexRegion(parts[1]))
                     ] = float(val)
+
+            # Neuromodulator baseline (backward compat: missing → None)
+            nm_data = meta.get("neuromodulator_baseline")
+            if nm_data is not None:
+                state.neuromodulator_baseline = NeuromodulatorState(
+                    dopamine=nm_data.get("dopamine", 0.0),
+                    serotonin=nm_data.get("serotonin", 0.5),
+                    acetylcholine=nm_data.get("acetylcholine", 0.3),
+                    norepinephrine=nm_data.get("norepinephrine", 0.3),
+                )
+
+            # Habit store (basal ganglia) — restore tensor contexts from lists
+            habit_data = meta.get("habit_store")
+            if habit_data is not None:
+                for h in habit_data.get("habits", []):
+                    if isinstance(h.get("context"), list):
+                        h["context"] = torch.tensor(
+                            h["context"], dtype=DTYPE, device=get_device(),
+                        )
+            state.habit_store = habit_data
 
         except Exception as exc:
             raise RuntimeError(

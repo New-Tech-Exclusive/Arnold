@@ -108,6 +108,7 @@ class ModelInfoResponse(BaseModel):
     session_active: bool
     personality: dict
     mood: dict
+    neuromodulators: dict | None = None
 
 
 # =============================================================================
@@ -145,6 +146,7 @@ async def info():
         session_active=status["session_active"],
         personality=status["personality"],
         mood=status["mood"],
+        neuromodulators=status.get("neuromodulators"),
     )
 
 
@@ -217,20 +219,26 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
             token_queue.put_nowait(event)
 
         try:
+            import math
+            from collections import deque
+
             # ----------------------------------------------------------
             # Step 1: Process user input.
-            # Brainstem → novelty → limbic → cortex → hippocampus record.
-            # Returns initial logits for generation.
-            # The user's input is what drives all learning — NOT the output.
             # ----------------------------------------------------------
             logits, traces, novelty, reinforcement = brain.prepare_turn(req.message)
 
+            # Get neuromodulator state for temperature modulation
+            ne_value = None
+            if brain.limbic is not None:
+                ne_value = brain.limbic.neuromodulators.norepinephrine
+
             # ----------------------------------------------------------
-            # Step 2: Token-by-token generation with sampling.
-            # Each token is streamed immediately.
-            # Generated tokens are NEVER fed back as training data.
+            # Step 2: Token-by-token generation with full quality pipeline.
+            # Uses recurrent hidden state, context buffer attention,
+            # repetition penalty, entropy-adaptive + top-k + top-p sampling,
+            # and soft prompt anchoring.
             # ----------------------------------------------------------
-            rng = np.random.default_rng()
+            gen_params = brain._genome.generation
             generated_tokens: list[int] = []
             if isinstance(logits, torch.Tensor):
                 current_logits = logits.detach().cpu()
@@ -238,40 +246,85 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                 current_logits = torch.as_tensor(logits)
             vocab_size = current_logits.shape[0]
 
-            seen_tokens: list[int] = []  # for repetition penalty
+            bs = brain.brainstem
+            hidden_dim = bs.cooccurrence_weights.shape[1]
+            hidden_state = torch.zeros(hidden_dim, dtype=current_logits.dtype)
+            ctx_buf: deque[torch.Tensor] = deque(maxlen=gen_params.context_buffer_size)
+
+            # Soft prompt anchor from input embeddings
+            anchor: torch.Tensor | None = None
+            if brain._last_structured is not None:
+                mean_emb = brain._last_structured.embeddings.mean(dim=0).cpu()
+                anchor = bs.token_embeddings.cpu() @ mean_emb
+
+            # Recurrent weight from cortex
+            W_rec: torch.Tensor | None = None
+            for region in brain._genome.topology.active_regions:
+                if region in brain.cortex.regions:
+                    W_rec = brain.cortex.regions[region].W_recurrent.cpu()
+                    break
 
             t0 = time.perf_counter()
 
             for _ in range(req.max_tokens):
-                lgt_np = current_logits.numpy()
+                # Apply anchor
+                step_logits = current_logits.clone()
+                if anchor is not None:
+                    step_logits = step_logits + gen_params.anchor_weight * anchor
+
+                # --- Repetition penalty ---
+                if gen_params.repetition_penalty != 1.0 and generated_tokens:
+                    for t_id in set(generated_tokens):
+                        if 0 <= t_id < vocab_size:
+                            if step_logits[t_id] > 0:
+                                step_logits[t_id] /= gen_params.repetition_penalty
+                            else:
+                                step_logits[t_id] *= gen_params.repetition_penalty
+
+                # Also apply server-level rep penalty on top
+                lgt_np = step_logits.numpy()
+                # Modulate temperature by norepinephrine: high NE → more exploration
+                effective_temp = req.temperature
+                if ne_value is not None:
+                    effective_temp += (ne_value - 0.3) * 0.5
+                    effective_temp = max(0.1, min(effective_temp, 2.0))
                 tok_id = _sample(
                     lgt_np,
-                    seen_tokens,
-                    req.temperature,
+                    generated_tokens,
+                    effective_temp,
                     req.top_k,
                     req.top_p,
                     req.repetition_penalty,
-                    rng,
+                    np.random.default_rng(),
                 )
 
                 generated_tokens.append(tok_id)
-                seen_tokens.append(tok_id)
 
                 # Decode and stream immediately
                 text = _decode_token(tok_id)
                 emit({"token": text})
 
-                # Advance logits using brainstem co-occurrence signal for the
-                # last sampled token.  This keeps the distribution correlated
-                # with what was just said instead of decaying to pure noise.
-                tok_t = torch.tensor(tok_id, dtype=torch.long)
-                bs = brain.brainstem
-                emb = bs.token_embeddings[tok_t].cpu()               # (embed_dim,)
-                hidden = torch.relu(emb @ bs.cooccurrence_weights.cpu())    # (bs_hidden,)
-                recon = hidden @ bs.output_projection.cpu()                 # (embed_dim,)
-                next_signal = (bs.token_embeddings.cpu() @ recon)           # (vocab_size,)
-                # Blend: 65% context, 35% next-token signal
-                current_logits = 0.65 * current_logits + 0.35 * next_signal
+                # --- Recurrent hidden state update ---
+                emb = bs.token_embeddings[tok_id].cpu()
+                co_hidden = torch.relu(emb @ bs.cooccurrence_weights.cpu())
+
+                rec_input = co_hidden
+                if W_rec is not None:
+                    rec_input = gen_params.recurrent_mix * (hidden_state @ W_rec) + (1.0 - gen_params.recurrent_mix) * co_hidden
+                hidden_state = torch.tanh(rec_input)
+
+                # Context buffer attention
+                ctx_buf.append(hidden_state.detach().clone())
+                if len(ctx_buf) > 1:
+                    stack = torch.stack(list(ctx_buf))
+                    scores = torch.softmax(hidden_state @ stack.T / math.sqrt(hidden_dim), dim=0)
+                    context_vec = scores @ stack
+                    hidden_state = hidden_state + gen_params.context_attention_weight * context_vec
+
+                # Produce next logits from recurrent hidden state
+                recon = hidden_state @ bs.output_projection.cpu()
+                next_signal = bs.token_embeddings.cpu() @ recon
+                current_logits = 0.50 * current_logits + 0.50 * next_signal
 
             dt = time.perf_counter() - t0
             tok_s = len(generated_tokens) / max(dt, 1e-6)
@@ -293,6 +346,15 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                 "reinforcement": round(reinforcement, 4),
                 "age": brain.developmental_age,
                 "stage": brain.developmental_stage,
+                "neuromodulators": (
+                    {
+                        "dopamine": round(brain.limbic.neuromodulators.dopamine, 4),
+                        "serotonin": round(brain.limbic.neuromodulators.serotonin, 4),
+                        "acetylcholine": round(brain.limbic.neuromodulators.acetylcholine, 4),
+                        "norepinephrine": round(brain.limbic.neuromodulators.norepinephrine, 4),
+                    }
+                    if brain.limbic else None
+                ),
             })
 
         except Exception as exc:
@@ -465,8 +527,8 @@ def load_or_create_brain(args: argparse.Namespace) -> Brain:
         b = Brain(genome=genome, storage_dir=storage_dir, seed=args.seed, tokenizer=tokenizer)
 
     if not b.weight_store.exists():
-        print("  No saved state found — initialising a fresh brain (brainstem will be random).")
-        b.brainstem.freeze()  # freeze without saving; state persisted on first session_end
+        print("  No saved state found — initialising a fresh brain (brainstem will be random + trainable).")
+        b.brainstem.unfreeze()
     else:
         print(f"  Loaded brain state from {storage_dir}")
         print(f"  Brainstem frozen: {b.brainstem.is_frozen}")

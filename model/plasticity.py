@@ -6,7 +6,8 @@ fast they can change at any developmental stage.
 plasticity(age) = (P_max - P_floor) × e^(-λ × age) + P_floor
 
 Per-region λ values mean regions close at different rates.
-Mood can temporarily raise or lower effective plasticity above/below baseline.
+Acetylcholine directly gates effective plasticity (replaces the indirect
+mood.openness pathway).
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import math
 import numpy as np
 
 from .genome import Genome
-from .types_ import CortexRegion, DevelopmentalStage, MoodState
+from .types_ import CortexRegion, DevelopmentalStage, MoodState, NeuromodulatorState
 
 
 class PlasticitySystem:
@@ -44,41 +45,50 @@ class PlasticitySystem:
         age: int,
         mood: MoodState,
         ewc_protection: float = 0.0,
+        acetylcholine: float | None = None,
     ) -> float:
-        """Effective plasticity after mood modulation and EWC damping.
+        """Effective plasticity after neuromodulatory gating and EWC damping.
 
-        effective = base × mood_factor × (1 - ewc_protection)
+        Acetylcholine directly gates learning rate (when available).
+        Falls back to mood.openness modulation for backward compat.
+
+        effective = base × ach_factor × (1 - ewc_protection)
         """
         base = self.base_rate(region, age)
 
-        # Mood modulation: high openness boosts, low openness dampens
-        openness_center = 0.5
-        if mood.openness > openness_center:
-            mood_factor = 1.0 + self._params.mood_plasticity_boost * (
-                mood.openness - openness_center
-            ) / (1.0 - openness_center)
+        if acetylcholine is not None:
+            # Acetylcholine directly gates: 0 → half rate, 1 → double rate
+            ach_factor = 0.5 + 1.5 * acetylcholine
         else:
-            mood_factor = 1.0 - self._params.mood_plasticity_dampen * (
-                openness_center - mood.openness
-            ) / openness_center
+            # Legacy: mood openness modulation
+            openness_center = 0.5
+            if mood.openness > openness_center:
+                ach_factor = 1.0 + self._params.mood_plasticity_boost * (
+                    mood.openness - openness_center
+                ) / (1.0 - openness_center)
+            else:
+                ach_factor = 1.0 - self._params.mood_plasticity_dampen * (
+                    openness_center - mood.openness
+                ) / openness_center
 
         # EWC damping
         ewc_factor = 1.0 - ewc_protection
 
-        return float(np.clip(base * mood_factor * ewc_factor, 0.0, self._params.p_max))
+        return float(np.clip(base * ach_factor * ewc_factor, 0.0, self._params.p_max))
 
     def all_rates(
         self,
         age: int,
         mood: MoodState,
         ewc_protections: dict[CortexRegion, float] | None = None,
+        acetylcholine: float | None = None,
     ) -> dict[CortexRegion, float]:
         """Compute effective rates for all active regions."""
         ewc = ewc_protections or {}
         rates = {}
         for region in self._genome.topology.active_regions:
             prot = float(np.mean(ewc[region])) if region in ewc else 0.0
-            rates[region] = self.effective_rate(region, age, mood, prot)
+            rates[region] = self.effective_rate(region, age, mood, prot, acetylcholine)
         return rates
 
     def stage(self, age: int) -> DevelopmentalStage:

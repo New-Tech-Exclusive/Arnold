@@ -120,14 +120,68 @@ class Brainstem:
             self.attention_query.clamp_(params.min_weight, params.max_weight)
             self.attention_key.clamp_(params.min_weight, params.max_weight)
 
+            # --- Token embedding update via next-token prediction ---
+            # For each position t, predict embedding of token t+1 from context at t.
+            # The output_projection maps brainstem_hidden → embed_dim, so we use
+            # syntactic[t] @ output_projection as the predicted next embedding, and
+            # compare against the actual next embedding.  This gives the embeddings
+            # a sequential / predictive structure rather than staying random.
+            if seq_len > 1:
+                predicted_next = syntactic[:-1] @ self.output_projection  # (seq_len-1, embed_dim)
+                actual_next = self.token_embeddings[seq[1:].long()]        # (seq_len-1, embed_dim)
+                emb_error = actual_next - predicted_next                   # (seq_len-1, embed_dim)
+                # Update token_embeddings for the *next* tokens toward the prediction
+                for pos in range(seq_len - 1):
+                    tid = int(seq[pos + 1].item())
+                    self.token_embeddings[tid] += lr * 0.2 * emb_error[pos]
+                self.token_embeddings.clamp_(params.min_weight, params.max_weight)
+
         self._frozen = True
 
     def freeze(self) -> None:
         self._frozen = True
 
+    def unfreeze(self) -> None:
+        """Allow online Hebbian updates during conversation."""
+        self._frozen = False
+
     @property
     def is_frozen(self) -> bool:
         return self._frozen
+
+    def online_update(self, token_ids: torch.Tensor, lr: float = 0.0001) -> None:
+        """Light Hebbian update after each conversation turn.
+
+        Keeps the brainstem plastic during conversation at a much lower rate
+        than pretraining, so it can adapt to the specific conversational
+        vocabulary without catastrophically forgetting pretrain structure.
+        Only runs when the brainstem is unfrozen.
+        """
+        if self._frozen:
+            return
+        params = self._genome.hebbian
+        seq = token_ids.to(device=self._device, dtype=torch.long)
+        seq_len = int(seq.shape[0])
+        if seq_len < 2:
+            return
+
+        embeddings = self.token_embeddings[seq]       # (seq_len, embed_dim)
+        hidden     = self._relu(embeddings @ self.cooccurrence_weights)  # (seq_len, bs_h)
+        syntactic  = self._relu(hidden @ self.syntax_weights)            # (seq_len, bs_h)
+
+        # Co-occurrence (small update)
+        self.cooccurrence_weights += lr * (embeddings.T @ hidden) / seq_len
+        self.cooccurrence_weights.clamp_(params.min_weight, params.max_weight)
+
+        # Next-token embedding prediction
+        if seq_len > 1:
+            predicted_next = syntactic[:-1] @ self.output_projection  # (seq_len-1, embed_dim)
+            actual_next    = self.token_embeddings[seq[1:].long()]     # (seq_len-1, embed_dim)
+            emb_error      = actual_next - predicted_next
+            for pos in range(seq_len - 1):
+                tid = int(seq[pos + 1].item())
+                self.token_embeddings[tid] += lr * emb_error[pos]
+            self.token_embeddings.clamp_(params.min_weight, params.max_weight)
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -201,7 +255,7 @@ class Brainstem:
             current = getattr(self, name, None)
             if current is not None and current.shape == arr.shape:
                 setattr(self, name, arr.to(device=self._device, dtype=DTYPE).clone())
-        self._frozen = True
+        # Keep brainstem unfrozen after load so conversation can continue training it.
 
     # ------------------------------------------------------------------
     # Helpers

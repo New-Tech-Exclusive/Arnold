@@ -3,11 +3,26 @@
 Runs between sessions (or when the hippocampus buffer is full).
 This is where actual permanent learning happens.
 
-Four sequential stages:
-  Stage 1 — Replay
-  Stage 2 — Pruning
-  Stage 3 — EWC Protection
-  Stage 4 — Personality Vector Update
+Implements three-stage sleep consolidation (Tononi & Cirelli):
+
+  Stage A — Targeted Replay (NREM 1-2)
+    Sharp-wave ripple replay of high-priority records.
+    Interleaved with core memory prototypes (CLS theory).
+
+  Stage B — Global Synaptic Downscaling (NREM 3 / Slow-wave sleep)
+    ALL weights multiplicatively downscaled by a small factor (0.995).
+    Synaptic Homeostasis Hypothesis — prevents weight saturation.
+
+  Stage C — REM / Structural Integration
+    Hippocampus disconnects.  Cortex runs autonomously, generating
+    activation patterns driven purely by internal dynamics.  New memories
+    that activate similar patterns to old memories get their inter-region
+    highways strengthened — conceptual integration.
+
+Plus:
+  Stage 4 — EWC Protection
+  Stage 5 — Personality Vector Update
+  Stage 6 — Pruning
 """
 
 from __future__ import annotations
@@ -36,13 +51,27 @@ class ConsolidationReport:
     connections_pruned: int = 0
     weights_protected: int = 0
     personality_deltas: dict[str, float] | None = None
+    global_downscale_applied: bool = False
+    rem_patterns_generated: int = 0
+    rem_integrations: int = 0
 
 
 class ConsolidationEngine:
-    """The four-stage offline learning engine."""
+    """Three-stage sleep consolidation engine.
+
+    Stage A: Targeted replay with interleaved core memories (CLS).
+    Stage B: Global synaptic downscaling (Synaptic Homeostasis Hypothesis).
+    Stage C: REM — cortex autonomous processing for structural integration.
+    Plus: EWC protection, personality update, pruning.
+    """
+
+    # Maximum number of core memory prototypes retained
+    MAX_CORE_MEMORIES = 100
 
     def __init__(self, genome: Genome) -> None:
         self._genome = genome
+        # Core memories: high-priority activation prototypes for interleaved replay
+        self._core_memories: list[EpisodicRecord] = []
 
     def run(
         self,
@@ -53,31 +82,33 @@ class ConsolidationEngine:
         plasticity_rates: dict[CortexRegion, float],
         developmental_age: int,
     ) -> ConsolidationReport:
-        """Execute all four consolidation stages sequentially.
+        """Execute the full consolidation pipeline.
 
-        Args:
-            records: Drained from hippocampus, sorted by priority desc.
-            cortex: The Cortex instance (weights will be mutated).
-            ewc_scalars: EWC protection scalars per region (mutated).
-            personality: Current personality (mutated).
-            plasticity_rates: Current per-region plasticity rates.
-            developmental_age: Total interaction count.
-
-        Returns:
-            ConsolidationReport summarising the cycle.
+        Stage A: Replay (NREM stages 1-2)
+        Stage B: Global downscaling (NREM stage 3 / slow-wave)
+        Stage C: REM structural integration
+        Stage 4: Pruning
+        Stage 5: EWC Protection
+        Stage 6: Personality Update
         """
         report = ConsolidationReport()
 
-        # Stage 1: Replay
+        # Stage A: Targeted Replay (NREM 1-2)
         self._stage_replay(records, cortex, plasticity_rates, report)
 
-        # Stage 2: Pruning
+        # Stage B: Global Synaptic Downscaling (NREM 3 / Slow-wave)
+        self._stage_global_downscale(cortex, report)
+
+        # Stage C: REM — Structural Integration
+        self._stage_rem(cortex, report)
+
+        # Stage 4: Pruning
         self._stage_pruning(cortex, developmental_age, report)
 
-        # Stage 3: EWC Protection
+        # Stage 5: EWC Protection
         self._stage_ewc(cortex, ewc_scalars, report)
 
-        # Stage 4: Personality Update
+        # Stage 6: Personality Update
         self._stage_personality(records, personality, report)
 
         return report
@@ -95,19 +126,31 @@ class ConsolidationEngine:
     ) -> None:
         """Re-fire stored activation patterns through cortex weights.
 
-        High-priority records get replayed multiple times.
-        Strengthening magnitude ∝ priority × plasticity.
+        Implements Complementary Learning Systems (McClelland et al. 1995):
+        new records are interleaved with core memory prototypes during replay
+        to prevent catastrophic forgetting.
         """
         params = self._genome.consolidation
 
         if not records:
             return
 
-        # Normalise priorities to [0, 1] for replay count mapping
-        max_priority = max(r.consolidation_priority for r in records) or 1.0
+        # --- Interleaved replay: merge new records with core memories ---
+        # Core memories are replayed at lower learning rate to maintain stability
+        replay_list: list[tuple[EpisodicRecord, float]] = []  # (record, lr_scale)
 
+        # Add new records at full learning rate
+        max_priority = max(r.consolidation_priority for r in records) or 1.0
         for record in records:
             norm_priority = record.consolidation_priority / max_priority
+            replay_list.append((record, norm_priority))
+
+        # Interleave core memories at reduced rate (10% of normal)
+        for core_rec in self._core_memories:
+            replay_list.append((core_rec, 0.1))
+
+        for record, lr_scale in replay_list:
+            norm_priority = lr_scale if lr_scale <= 0.1 else lr_scale
             n_replays = int(
                 params.replay_passes_min
                 + norm_priority * (params.replay_passes_max - params.replay_passes_min)
@@ -119,12 +162,25 @@ class ConsolidationEngine:
                     region = trace.region
                     if region not in cortex.regions:
                         continue
-                    lr = plasticity_rates.get(region, 0.01) * norm_priority
+                    lr = plasticity_rates.get(region, 0.01) * lr_scale
                     cortex.regions[region].hebbian_update(trace, lr)
 
                 report.total_replay_passes += 1
 
             report.records_replayed += 1
+
+        # --- Update core memories: keep highest-priority records ---
+        for record in records:
+            if len(self._core_memories) < self.MAX_CORE_MEMORIES:
+                self._core_memories.append(record)
+            else:
+                # Replace lowest-priority core memory if this one is higher
+                min_idx = min(
+                    range(len(self._core_memories)),
+                    key=lambda i: self._core_memories[i].consolidation_priority,
+                )
+                if record.consolidation_priority > self._core_memories[min_idx].consolidation_priority:
+                    self._core_memories[min_idx] = record
 
         # Also update inter-region wiring based on co-activated records
         # Gather all traces that co-occurred within the same record
@@ -156,7 +212,75 @@ class ConsolidationEngine:
                 cortex.wiring.hebbian_update(mock_acts, mean_lr * 0.1)
 
     # ==================================================================
-    # Stage 2 — Pruning
+    # Stage B — Global Synaptic Downscaling (Slow-wave sleep)
+    # ==================================================================
+
+    def _stage_global_downscale(
+        self,
+        cortex,
+        report: ConsolidationReport,
+    ) -> None:
+        """Synaptic Homeostasis Hypothesis (Tononi & Cirelli).
+
+        ALL synapses weaken slightly — a universal multiplicative downscaling.
+        This is NOT targeted pruning.  EVERY weight gets multiplied by a
+        factor just below 1.0 (e.g. 0.995).  Prevents runaway potentiation
+        and weight saturation over thousands of sessions.
+        """
+        factor = self._genome.sleep.global_downscale_factor
+
+        for region in self._genome.topology.active_regions:
+            if region not in cortex.regions:
+                continue
+            mod = cortex.regions[region]
+            mod.W_in *= factor
+            mod.W_hidden *= factor
+            mod.W_out *= factor
+            mod.W_recurrent *= factor
+
+        # Also downscale inter-region wiring
+        for key in cortex.wiring.connections:
+            cortex.wiring.connections[key] *= factor
+
+        report.global_downscale_applied = True
+
+    # ==================================================================
+    # Stage C — REM (Structural Integration)
+    # ==================================================================
+
+    def _stage_rem(
+        self,
+        cortex,
+        report: ConsolidationReport,
+    ) -> None:
+        """REM sleep: hippocampus disconnects, cortex runs autonomously.
+
+        The cortex generates activation patterns driven purely by internal
+        dynamics (predictions feeding back).  Patterns that activate similar
+        regions to existing memories get their inter-region highways
+        strengthened — this is how conceptual integration happens.
+        """
+        sleep = self._genome.sleep
+        rem_steps = sleep.rem_steps
+        rem_lr = sleep.rem_integration_lr
+
+        # Run cortex autonomously
+        patterns = cortex.run_autonomous(steps=rem_steps)
+        report.rem_patterns_generated = len(patterns)
+
+        # Structural integration: strengthen inter-region connections
+        # where co-activation is high during autonomous processing
+        integrations = 0
+        from .types_ import RegionActivation
+        for act_dict in patterns:
+            if len(act_dict) >= 2:
+                cortex.wiring.hebbian_update(act_dict, rem_lr)
+                integrations += 1
+
+        report.rem_integrations = integrations
+
+    # ==================================================================
+    # Stage 4 — Pruning
     # ==================================================================
 
     def _stage_pruning(
@@ -186,7 +310,7 @@ class ConsolidationEngine:
         report.connections_pruned = total_pruned
 
     # ==================================================================
-    # Stage 3 — EWC Protection
+    # Stage 5 — EWC Protection
     # ==================================================================
 
     def _stage_ewc(
@@ -233,7 +357,7 @@ class ConsolidationEngine:
         report.weights_protected = total_protected
 
     # ==================================================================
-    # Stage 4 — Personality Vector Update
+    # Stage 6 — Personality Vector Update
     # ==================================================================
 
     def _stage_personality(

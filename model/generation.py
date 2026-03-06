@@ -2,14 +2,25 @@
 
 Orchestrates what actually happens during a conversation: the per-turn
 processing pipeline and the between-turn partial updates.
+
+Implements:
+  - Recurrent hidden state (carry-forward across tokens)
+  - Context buffer with dot-product attention (sliding window)
+  - In-loop repetition penalty
+  - Entropy-adaptive sampling
+  - Top-k / top-p (nucleus) sampling
+  - Soft prompt anchoring for topic coherence
 """
 
 from __future__ import annotations
 
+import math
+from collections import deque
+
 import torch
 
 from .genome import Genome
-from .tensor import DTYPE
+from .tensor import DTYPE, get_device
 from .types_ import (
     CortexRegion,
     HebbianTrace,
@@ -25,9 +36,10 @@ class GenerationInterface:
 
     def __init__(self, genome: Genome, rng: object | None = None) -> None:
         self._genome = genome
+        self._device = get_device()
 
     # ------------------------------------------------------------------
-    # Token sampling
+    # Token sampling  (top-k, top-p, entropy-adaptive, rep penalty)
     # ------------------------------------------------------------------
 
     def sample_token(
@@ -35,27 +47,91 @@ class GenerationInterface:
         logits: torch.Tensor,
         mood: MoodState,
         novelty_score: float,
+        generated_so_far: list[int] | None = None,
+        norepinephrine: float | None = None,
     ) -> int:
-        """Sample a token from combined cortex logits.
+        """Sample a token with full quality pipeline.
 
-        Dynamic temperature from mood and novelty:
-          temp = base + valence_boost + novelty_boost
+        1. Apply repetition penalty on already-generated tokens.
+        2. Dynamic temperature from norepinephrine (or mood fallback) + novelty.
+        3. Entropy-adaptive narrowing.
+        4. Top-k filtering.
+        5. Top-p (nucleus) filtering.
+        6. Multinomial sample.
         """
         gen = self._genome.generation
         nov = self._genome.novelty
 
-        # Dynamic temperature
+        logits = logits.clone()
+
+        # --- 1. In-loop repetition penalty ---
+        if generated_so_far and gen.repetition_penalty != 1.0:
+            seen = set(generated_so_far)
+            for tok_id in seen:
+                if 0 <= tok_id < logits.shape[0]:
+                    if logits[tok_id] > 0:
+                        logits[tok_id] /= gen.repetition_penalty
+                    else:
+                        logits[tok_id] *= gen.repetition_penalty
+
+        # --- 2. Dynamic temperature ---
+        # Norepinephrine directly controls temperature: high NE → higher temp (more exploration)
         temp = gen.base_temperature
-        temp += mood.valence * 0.1           # positive mood → slightly warmer
-        temp += novelty_score * nov.temperature_boost  # novelty → more exploratory
+        # Sanitize inputs before using them
+        if norepinephrine is not None and norepinephrine == norepinephrine:  # NaN guard
+            # Gentler effect: NE range 0..1 → temp delta of -0.1..+0.14
+            temp += (float(max(min(norepinephrine, 1.0), 0.0)) - 0.3) * 0.2
+        else:
+            temp += mood.valence * 0.05
+        if novelty_score == novelty_score:  # NaN guard
+            temp += float(max(min(novelty_score, 1.0), 0.0)) * nov.temperature_boost
         temp = float(max(min(temp, gen.max_temperature), gen.min_temperature))
 
-        # Softmax with temperature
-        probs = self._softmax(logits / temp)
+        # Guard against NaN/Inf logits before sampling
+        if not torch.isfinite(logits).all():
+            logits = logits.nan_to_num(0.0).clamp(-50.0, 50.0)
 
-        # Sample
+        scaled = logits / max(temp, 1e-8)
+
+        # --- 3. Entropy-adaptive narrowing ---
+        probs = self._softmax(scaled)
+        entropy = -float(torch.sum(probs * torch.log(probs + 1e-12)).item())
+
+        effective_top_k = gen.top_k
+        if entropy > gen.entropy_high_threshold:
+            # Model is confused → narrow to top-5 (avoids collapsing to top-3
+            # which is effectively random on untrained uniform logits)
+            effective_top_k = min(gen.top_k, 5)
+        elif entropy < gen.entropy_low_threshold:
+            # Model is confident → sample normally
+            effective_top_k = gen.top_k
+
+        # --- 4. Top-k filtering ---
+        if effective_top_k > 0 and effective_top_k < logits.shape[0]:
+            top_vals, _ = torch.topk(scaled, effective_top_k)
+            threshold = top_vals[-1]
+            scaled[scaled < threshold] = float('-inf')
+
+        # --- 5. Top-p (nucleus) filtering ---
+        if gen.top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+            cum_probs = torch.cumsum(self._softmax(sorted_logits), dim=0)
+            cutoff_mask = cum_probs > gen.top_p
+            # Shift mask right so at least one token is always kept
+            cutoff_mask[1:] = cutoff_mask[:-1].clone()
+            cutoff_mask[0] = False
+            sorted_logits[cutoff_mask] = float('-inf')
+            # Scatter back
+            scaled.scatter_(0, sorted_indices, sorted_logits)
+
+        # --- 6. Final softmax and sample ---
+        probs = self._softmax(scaled)
         token_id = int(torch.multinomial(probs, num_samples=1).item())
         return token_id
+
+    # ------------------------------------------------------------------
+    # Sequence generation with recurrent state + context attention
+    # ------------------------------------------------------------------
 
     def generate_sequence(
         self,
@@ -65,35 +141,107 @@ class GenerationInterface:
         max_tokens: int = 64,
         eos_token: int | None = None,
         brainstem=None,
+        cortex=None,
+        anchor_embeddings: torch.Tensor | None = None,
+        norepinephrine: float | None = None,
     ) -> list[int]:
-        """Generate a sequence of tokens.
+        """Generate a token sequence with recurrent hidden state and context attention.
 
-        Each step the logits are advanced by mixing the current distribution
-        with the brainstem's co-occurrence signal for the last sampled token,
-        preventing the distribution from collapsing to a single repeated token.
+        Key improvements over the previous version:
+        1. Recurrent hidden state carried across every token.
+        2. Context buffer (deque) with dot-product attention over recent states.
+        3. Repetition penalty applied at every step inside the loop.
+        4. Entropy-adaptive + top-k + top-p sampling.
+        5. Soft prompt anchor keeps generation on-topic.
+        6. Norepinephrine directly controls generation temperature.
         """
+        gen = self._genome.generation
+        device = self._device
+
         tokens: list[int] = []
-        logits = initial_logits.detach().clone()
+        logits = initial_logits.detach().clone().to(device)
+
+        # Bootstrap initial logits from brainstem's pretrained vocabulary.
+        # The cortex W_out is random at birth; it adds only a tiny correction
+        # that grows meaningful over thousands of training turns.
+        if brainstem is not None and anchor_embeddings is not None:
+            mean_emb = anchor_embeddings.mean(dim=0).to(device)          # (embed_dim,)
+            co_h = torch.relu(mean_emb @ brainstem.cooccurrence_weights.to(device))  # (hidden_dim,)
+            base_recon = co_h @ brainstem.output_projection.to(device)    # (embed_dim,)
+            base_logits = brainstem.token_embeddings.to(device) @ base_recon  # (vocab_size,)
+            # Cortex logits are a small learned correction on top of brainstem base
+            logits = base_logits + 0.05 * logits
+
+        # --- Recurrent hidden state ---
+        # Use brainstem_hidden as the recurrent dimension
+        if brainstem is not None:
+            hidden_dim = brainstem.cooccurrence_weights.shape[1]  # brainstem_hidden
+        else:
+            hidden_dim = logits.shape[0]
+
+        hidden_state = torch.zeros(hidden_dim, dtype=DTYPE, device=device)
+
+        # --- Context buffer for sliding-window attention ---
+        ctx_buf: deque[torch.Tensor] = deque(maxlen=gen.context_buffer_size)
+
+        # --- Soft prompt anchor ---
+        anchor: torch.Tensor | None = None
+        if anchor_embeddings is not None and brainstem is not None:
+            # Project mean of input embeddings to vocab-sized anchor bias
+            mean_emb = anchor_embeddings.mean(dim=0)  # (embed_dim,)
+            anchor = brainstem.token_embeddings @ mean_emb  # (vocab_size,)
+
+        # Get recurrent weight from cortex (use first active region)
+        W_rec: torch.Tensor | None = None
+        if cortex is not None:
+            for region in cortex._genome.topology.active_regions:
+                if region in cortex.regions:
+                    W_rec = cortex.regions[region].W_recurrent.to(device)
+                    break
 
         for _ in range(max_tokens):
-            token = self.sample_token(logits, mood, novelty_score)
+            # --- Apply soft prompt anchor ---
+            step_logits = logits.clone()
+            if anchor is not None:
+                step_logits = step_logits + gen.anchor_weight * anchor
+
+            # --- Sample token ---
+            token = self.sample_token(
+                step_logits, mood, novelty_score, generated_so_far=tokens,
+                norepinephrine=norepinephrine,
+            )
             tokens.append(token)
 
             if eos_token is not None and token == eos_token:
                 break
 
-            # Advance logits using brainstem co-occurrence if available,
-            # otherwise fall back to small random perturbation.
+            # --- Update recurrent hidden state ---
             if brainstem is not None:
-                emb = brainstem.token_embeddings[token]           # (embed_dim,)
-                # Project through co-occurrence → syntax → output_projection
-                # to get next-token signal in embed space, then re-score vocab.
-                hidden = torch.relu(emb @ brainstem.cooccurrence_weights)  # (bs_hidden,)
-                recon = hidden @ brainstem.output_projection               # (embed_dim,)
-                # Dot each vocab embedding against the predicted next embedding.
-                next_signal = brainstem.token_embeddings @ recon            # (vocab_size,)
-                # Mix: retain 60% of current context, add 40% next-token signal.
-                logits = 0.60 * logits + 0.40 * next_signal
+                emb = brainstem.token_embeddings[token].to(device)  # (embed_dim,)
+                co_hidden = torch.relu(emb @ brainstem.cooccurrence_weights.to(device))  # (hidden_dim,)
+
+                # Recurrent update: h = tanh(mix * W_rec @ h + (1-mix) * co_hidden)
+                rec_input = co_hidden
+                if W_rec is not None:
+                    rec_input = gen.recurrent_mix * (hidden_state @ W_rec) + (1.0 - gen.recurrent_mix) * co_hidden
+                hidden_state = torch.tanh(rec_input)
+
+                # --- Context buffer attention ---
+                ctx_buf.append(hidden_state.detach().clone())
+
+                if len(ctx_buf) > 1:
+                    stack = torch.stack(list(ctx_buf))  # (K, hidden_dim)
+                    scores = hidden_state @ stack.T / math.sqrt(hidden_dim)
+                    attn = self._softmax(scores)
+                    context_vec = attn @ stack
+                    hidden_state = hidden_state + gen.context_attention_weight * context_vec
+
+                # --- Produce next logits from hidden state ---
+                recon = hidden_state @ brainstem.output_projection.to(device)  # (embed_dim,)
+                next_signal = brainstem.token_embeddings.to(device) @ recon  # (vocab_size,)
+
+                # Blend: 50% existing context, 50% recurrent next-token signal
+                logits = 0.50 * logits + 0.50 * next_signal
             else:
                 logits = logits + torch.randn_like(logits, dtype=DTYPE) * 0.05
 

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -30,7 +32,29 @@ from model.tensor import get_device, seed_all
 
 TOKENIZER = None
 TOKENIZER_VOCAB_LIMIT: int | None = None
-VOCAB_SIZE = 30000
+VOCAB_SIZE = 50257
+
+
+def _successful_exit() -> None:
+    """Terminate cleanly after successful pretraining.
+
+    The Hugging Face streaming stack can crash during Python 3.12 interpreter
+    finalization after all useful work is already done. Clear heavyweight
+    globals, flush stdio, and exit the process before that teardown path runs.
+    """
+    global TOKENIZER, TOKENIZER_VOCAB_LIMIT
+    TOKENIZER = None
+    TOKENIZER_VOCAB_LIMIT = None
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 @dataclass
@@ -41,7 +65,7 @@ class TrainingConfig:
     text_field: str | None = None
     streaming: bool = True
 
-    steps: int = 300000
+    steps: int = 500
     lr: float = 0.01
     max_seq_len: int = 2048
 
@@ -68,6 +92,11 @@ class TrainingConfig:
         cfg = cls()
         if args.config:
             cfg = cls.from_json(args.config)
+        # Apply named preset first so individual arg flags can still override it
+        preset = getattr(args, "preset", None)
+        if preset and preset in _DATASET_PRESETS:
+            for key, val in _DATASET_PRESETS[preset].items():
+                setattr(cfg, key, val)
         for key in cls.__dataclass_fields__.keys():
             val = getattr(args, key, None)
             if val is not None:
@@ -327,6 +356,29 @@ def pretrain(cfg: TrainingConfig) -> None:
     print(f"    python chat_server.py --storage_dir {storage_dir}\n")
 
 
+# Named dataset presets — pass --preset <name> to quickly switch corpora.
+# Individual flags (--dataset, --split, etc.) override the preset.
+_DATASET_PRESETS: dict[str, dict[str, str]] = {
+    "wildchat": {
+        "dataset": "allenai/WildChat-1M",
+        "split": "train",
+    },
+    "tinystories": {  # clean simple narrative; ideal for early developmental stage
+        "dataset": "roneneldan/TinyStories",
+        "split": "train",
+    },
+    "wikitext": {  # factual Wikipedia prose
+        "dataset": "wikitext",
+        "dataset_config": "wikitext-103-v1",
+        "split": "train",
+    },
+    "openhermes": {  # instruction-tuning Q&A pairs
+        "dataset": "teknium/OpenHermes-2.5",
+        "split": "train",
+    },
+}
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Pretrain the Arnold brain brainstem on a HuggingFace dataset",
@@ -341,6 +393,17 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--split", default=None, help="Dataset split to use")
     g.add_argument("--text_field", default=None, help="Name of text column")
     g.add_argument("--streaming", action="store_true", default=None, help="Use HF streaming mode")
+    g.add_argument(
+        "--preset", default=None,
+        choices=["wildchat", "tinystories", "wikitext", "openhermes"],
+        help=(
+            "Named dataset preset (shortcut for --dataset + --split).\n"
+            "  wildchat    — allenai/WildChat-1M (default, diverse dialogue)\n"
+            "  tinystories — roneneldan/TinyStories (clean, simple narrative; best for infancy)\n"
+            "  wikitext    — wikitext-103 (factual Wikipedia prose)\n"
+            "  openhermes  — teknium/OpenHermes-2.5 (instruction Q&A pairs)"
+        ),
+    )
 
     g = p.add_argument_group("Training")
     g.add_argument("--steps", type=int, default=None, help="Hebbian update steps")
@@ -372,3 +435,4 @@ if __name__ == "__main__":
         raise SystemExit(0)
     cfg = TrainingConfig.from_args(args)
     pretrain(cfg)
+    _successful_exit()

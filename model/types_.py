@@ -46,7 +46,7 @@ class ReinforcementType(enum.Enum):
 
 @dataclass
 class MoodState:
-    """Rolling emotional state vector."""
+    """Rolling emotional state vector (legacy view — derived from neuromodulators)."""
     valence: float = 0.0    # -1.0 (negative) → +1.0 (positive)
     arousal: float = 0.0    #  0.0 (calm)     → 1.0  (activated)
     openness: float = 0.5   #  0.0 (guarded)  → 1.0  (receptive)
@@ -58,6 +58,35 @@ class MoodState:
         self.valence = float(max(min(self.valence, 1.0), -1.0))
         self.arousal = float(max(min(self.arousal, 1.0), 0.0))
         self.openness = float(max(min(self.openness, 1.0), 0.0))
+
+
+@dataclass
+class NeuromodulatorState:
+    """Four distinct neurochemical systems replacing the single mood proxy.
+
+    Dopamine      — prediction error signal (better/worse than expected)
+    Serotonin     — patience / time horizon
+    Acetylcholine — learning signal (directly gates Hebbian rates)
+    Norepinephrine — uncertainty / exploration drive
+    """
+    dopamine: float = 0.0         # -1..1  prediction error
+    serotonin: float = 0.5        #  0..1  patience
+    acetylcholine: float = 0.3    #  0..1  learning gate
+    norepinephrine: float = 0.3   #  0..1  exploration
+
+    def clamp(self) -> None:
+        self.dopamine = float(max(min(self.dopamine, 1.0), -1.0))
+        self.serotonin = float(max(min(self.serotonin, 1.0), 0.0))
+        self.acetylcholine = float(max(min(self.acetylcholine, 1.0), 0.0))
+        self.norepinephrine = float(max(min(self.norepinephrine, 1.0), 0.0))
+
+    def to_mood(self) -> "MoodState":
+        """Derive a legacy MoodState view from neuromodulators."""
+        return MoodState(
+            valence=self.dopamine,
+            arousal=self.norepinephrine,
+            openness=self.acetylcholine,
+        )
 
 
 @dataclass
@@ -130,6 +159,8 @@ class EpisodicRecord:
     interaction_number: int
     repetition_count: int = 0
     consolidation_priority: float = 0.0
+    prediction_error: float = 0.0  # from predictive coding
+    neuromodulators_at_event: Optional[NeuromodulatorState] = None
 
     def compute_priority(self) -> None:
         self.consolidation_priority = (
@@ -146,6 +177,7 @@ class RegionActivation:
     logits: torch.Tensor          # (vocab_size,)
     hidden: torch.Tensor          # (hidden_dim,)
     fired_indices: torch.Tensor   # which units crossed threshold
+    prediction_error: float = 0.0  # mean absolute prediction error from this pass
 
 
 @dataclass
@@ -161,3 +193,10 @@ class BrainState:
     plasticity_rates: dict[CortexRegion, float] = field(default_factory=dict)
     consolidation_meta: dict = field(default_factory=dict)
     inter_region_highway: dict[tuple[CortexRegion, CortexRegion], float] = field(default_factory=dict)
+    # New component weights
+    neuromodulator_baseline: Optional[NeuromodulatorState] = None
+    thalamus_weights: dict[str, torch.Tensor] = field(default_factory=dict)
+    cerebellum_weights: dict[str, torch.Tensor] = field(default_factory=dict)
+    astrocyte_usage: dict[CortexRegion, torch.Tensor] = field(default_factory=dict)
+    cortex_predictions: dict[CortexRegion, torch.Tensor] = field(default_factory=dict)
+    habit_store: Optional[dict] = None

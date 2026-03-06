@@ -7,6 +7,7 @@ surprising the input is relative to what the model has already learned.
 
 from __future__ import annotations
 
+import math
 import torch
 
 from .genome import Genome
@@ -19,6 +20,9 @@ class NoveltyDetector:
     def __init__(self, genome: Genome) -> None:
         self._genome = genome
         self._params = genome.novelty
+        # Running EMA of raw prediction errors — prevents novelty saturating at 1.0
+        # when untrained weights produce uniformly large errors.
+        self._error_ema: float = 2.0
 
     def score(
         self,
@@ -46,34 +50,48 @@ class NoveltyDetector:
 
         # For each active region, measure prediction confidence
         prediction_confidences: list[float] = []
+        raw_errors: list[float] = []
 
         for region, act in activations.items():
             if region == CortexRegion.OCCIPITAL:
                 continue  # dormant
 
+            # --- Prediction-error confidence (reliable from day 1) ---
+            # Normalize by running EMA baseline so untrained models (large uniform
+            # errors) don't saturate novelty at 1.0 and pin NE at max forever.
+            raw_err = max(act.prediction_error, 0.0)
+            raw_errors.append(raw_err)
+            normalized_err = raw_err / (self._error_ema + 1e-6)
+            err_confidence = float(math.exp(-normalized_err))
+
+            # --- Logit-based confidence (grows meaningful as W_out trains) ---
             logits = act.logits  # (vocab_size,)
-
-            # Convert to probability distribution via softmax
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
             probs = self._softmax(logits / self._params.temperature)
-
-            # Measure how much probability mass landed on the actual tokens
             if len(token_ids) > 0:
-                # Average probability the model assigned to the actual tokens
                 valid_ids = token_ids[token_ids < probs.shape[0]]
-                if int(valid_ids.numel()) > 0:
-                    assigned_probs = probs[valid_ids]
-                    confidence = float(assigned_probs.mean())
-                else:
-                    confidence = 0.0
+                logit_confidence = float(probs[valid_ids].mean()) if int(valid_ids.numel()) > 0 else 0.0
             else:
-                confidence = 0.0
+                logit_confidence = 0.0
 
+            # Blend: prediction error signal is strong from day 1;
+            # logit confidence contribution grows as W_out trains up.
+            confidence = 0.7 * err_confidence + 0.3 * logit_confidence
             prediction_confidences.append(confidence)
 
-        if not prediction_confidences:
-            return 1.0  # no predictions → maximum novelty
+        # Update EMA baseline from this call's prediction errors
+        if raw_errors:
+            batch_mean = sum(raw_errors) / len(raw_errors)
+            self._error_ema = 0.90 * self._error_ema + 0.10 * batch_mean
 
-        mean_confidence = float(sum(prediction_confidences) / max(len(prediction_confidences), 1))
+        if not prediction_confidences:
+            return 0.5  # no predictions → moderate novelty (not max, to avoid NE spike)
+
+        # Filter NaN values before averaging
+        valid = [c for c in prediction_confidences if c == c]
+        if not valid:
+            return 0.5
+        mean_confidence = float(sum(valid) / len(valid))
 
         # Novelty = 1 - confidence  (clamped)
         novelty = float(max(min(1.0 - mean_confidence, 1.0), 0.0))

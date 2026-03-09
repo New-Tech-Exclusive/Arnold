@@ -1,0 +1,19 @@
+{
+  "dataset": "allenai/WildChat-1M",
+  "dataset_config": null,
+  "split": "train",
+  "text_field": null,
+  "streaming": false,
+  "steps": 30000,
+  "lr": 0.01,
+  "max_seq_len": 2048,
+  "embed_dim": 448,
+  "encoder_hidden": 896,
+  "transformer_hidden": 896,
+  "memory_capacity": 4096,
+  "vocab_size": null,
+  "tokenizer_name": "gpt2",
+  "storage_dir": "./model/pretrained",
+  "resume": false,
+  "seed": 42
+}

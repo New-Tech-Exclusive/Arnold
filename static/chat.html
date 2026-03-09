@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arnold</title>
+  <link rel="stylesheet" href="/static/chat.css" />
+</head>
+<body>
+  <!-- ── Sidebar ───────────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <span class="brand">Arnold</span>
+      <button class="new-chat-btn" id="newChatBtn" title="New chat">＋ New chat</button>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="section-label">Sampling</div>
+
+      <label class="param-row">
+        <span>Temperature</span>
+        <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.8" />
+        <output id="temperature-val">0.8</output>
+      </label>
+
+      <label class="param-row">
+        <span>Top-K</span>
+        <input type="range" id="top_k" min="1" max="200" step="1" value="50" />
+        <output id="top_k-val">50</output>
+      </label>
+
+      <label class="param-row">
+        <span>Top-P</span>
+        <input type="range" id="top_p" min="0" max="1" step="0.01" value="0.95" />
+        <output id="top_p-val">0.95</output>
+      </label>
+
+      <label class="param-row">
+        <span>Max tokens</span>
+        <input type="range" id="max_tokens" min="16" max="2048" step="16" value="256" />
+        <output id="max_tokens-val">256</output>
+      </label>
+
+      <label class="param-row">
+        <span>Rep. penalty</span>
+        <input type="range" id="rep_penalty" min="1" max="3" step="0.05" value="1.1" />
+        <output id="rep_penalty-val">1.1</output>
+      </label>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="section-label">Model status</div>
+      <div class="status-grid" id="statusGrid">
+        <span class="sk">Stage</span><span class="sv" id="stageVal">—</span>
+        <span class="sk">Age</span><span class="sv" id="ageVal">—</span>
+        <span class="sk">Parameters</span><span class="sv" id="paramsVal">—</span>
+        <span class="sk">Session</span><span class="sv" id="sessionVal">—</span>
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <a id="statusLink" href="#" class="status-link">Full status ↗</a>
+    </div>
+  </aside>
+
+  <!-- ── Main area ─────────────────────────────────────────────────────── -->
+  <main class="chat-main">
+    <header class="chat-header">
+      <span class="model-info" id="modelInfo">Loading…</span>
+    </header>
+
+    <div class="messages" id="messages">
+      <div class="welcome">
+        <h2>Arnold</h2>
+        <p>A biologically-inspired adaptive model.<br>Everything you say shapes how it thinks.</p>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <div class="input-box">
+        <textarea
+          id="userInput"
+          placeholder="Message Arnold…"
+          rows="1"
+          autocomplete="off"
+          spellcheck="true"
+        ></textarea>
+        <div class="input-actions">
+          <button id="stopBtn" class="btn-icon btn-stop" title="Stop" style="display:none;">■</button>
+          <button id="sendBtn" class="btn-send" title="Send (Enter)">↑</button>
+        </div>
+      </div>
+      <div class="input-footer">
+        Arnold learns from your messages — not its own output.
+      </div>
+    </div>
+  </main>
+
+  <script src="/static/chat.js"></script>
+</body>
+</html>

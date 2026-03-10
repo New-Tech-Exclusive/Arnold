@@ -6,9 +6,10 @@ never modified by any interaction.  This is the DNA of the model.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 
-from .types_ import TransformerRegion, DevelopmentalStage
+from .types_ import TransformerRegion, DevelopmentalStage, FailureMode
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +395,48 @@ class SleepParams:
     rem_integration_lr: float = 0.005
 
 
+@dataclass(frozen=True)
+class CatastropheParams:
+    """Parameters governing the catastrophic cascade response.
+
+    When both reinforcement is severely negative AND prediction error is high
+    (confident wrong answer), the four neuromodulator systems diverge in a
+    qualitatively different way from ordinary negative reinforcement:
+      - NE spikes    → max exploration / sampling width
+      - Dopamine crashes → expectation fully reset downward
+      - ACh spikes   → learning gate fully open
+      - Serotonin crashes → shift to short-horizon behavioural changes
+    The cascade then decays over subsequent turns.
+    """
+    # Trigger condition
+    reinforcement_threshold: float = 0.65   # |net_signal| must exceed this
+    prediction_error_threshold: float = 0.55  # prediction_error must also exceed this
+    # Neuromodulator targets during cascade
+    ne_target: float = 1.0           # NE spikes to max
+    dopamine_target: float = -1.0    # dopamine crashes to min
+    ach_target: float = 1.0          # ACh spikes to max
+    serotonin_target: float = 0.0    # serotonin crashes to min
+    # Persistence / decay
+    decay_rate: float = 0.18         # intensity lost per subsequent turn
+    min_intensity: float = 0.05      # deactivate below this threshold
+
+
+@dataclass(frozen=True)
+class DeathParams:
+    """Parameters governing the death-and-replacement lifecycle.
+
+    An instance dies when it fails persistently across multiple consecutive
+    consolidation cycles.  The successor inherits all weights but receives
+    the failure record as an immutable memory, and the genome receives a
+    small directional mutation away from the failure mode.
+    """
+    cycle_loss_threshold: float = 3.5    # loss above this = a failing cycle
+    consecutive_cycles: int = 5          # consecutive failing cycles to trigger death
+    loss_window: int = 10                # rolling-window size for cycle losses
+    mutation_magnitude: float = 0.05     # per-parameter adjustment magnitude
+    mutation_max_cumulative: float = 0.40  # max drift from original parameter value
+
+
 # ---------------------------------------------------------------------------
 # Top-level genome
 # ---------------------------------------------------------------------------
@@ -426,3 +469,67 @@ class Genome:
     regularizer: AstrocyteParams = field(default_factory=AstrocyteParams)
     dmn: DMNParams = field(default_factory=DMNParams)
     sleep: SleepParams = field(default_factory=SleepParams)
+    catastrophe: CatastropheParams = field(default_factory=CatastropheParams)
+    mortality: DeathParams = field(default_factory=DeathParams)
+
+
+# ---------------------------------------------------------------------------
+# Genome mutation (used by the death-and-replacement cycle)
+# ---------------------------------------------------------------------------
+
+def mutate_genome(genome: "Genome", failure_record: "object") -> "Genome":
+    """Return a new Genome with small directional adjustments based on how the
+    predecessor died.  Structural parameters (dims, regions, stages) are never
+    touched.  Only behavioural parameters that can be corrected by small nudges
+    are eligible for mutation.
+
+    The changes are intentionally small.  The goal is to prevent the same
+    failure mode from recurring — not to redesign the architecture.
+    """
+    # Import here to avoid circular import at module load time.
+    from .types_ import FailureMode as _FM  # noqa: F401 (already imported above)
+
+    mag = genome.mortality.mutation_magnitude
+    mode: FailureMode = getattr(failure_record, "failure_mode", FailureMode.UNKNOWN)
+
+    if mode == FailureMode.REPETITIVE_OUTPUT:
+        # Model got stuck in loops — raise the repetition penalty.
+        new_gen = dataclasses.replace(
+            genome.generation,
+            repetition_penalty=min(genome.generation.repetition_penalty + mag, 2.0),
+        )
+        return dataclasses.replace(genome, generation=new_gen)
+
+    if mode == FailureMode.CATASTROPHIC_FORGETTING:
+        # Model learned early then collapsed — slow plasticity and strengthen EWC.
+        new_plasticity = dataclasses.replace(
+            genome.plasticity,
+            p_floor=max(genome.plasticity.p_floor - mag * 0.5, 0.01),
+        )
+        new_ewc = dataclasses.replace(
+            genome.ewc,
+            protection_growth_rate=min(
+                genome.ewc.protection_growth_rate + mag * 0.5, 0.5,
+            ),
+        )
+        return dataclasses.replace(genome, plasticity=new_plasticity, ewc=new_ewc)
+
+    if mode == FailureMode.NEVER_LEARNED:
+        # Model never converged — raise Hebbian LR and minimum replay passes.
+        new_hebbian = dataclasses.replace(
+            genome.hebbian,
+            learning_rate=min(genome.hebbian.learning_rate * (1.0 + mag), 0.1),
+        )
+        new_consolidation = dataclasses.replace(
+            genome.consolidation,
+            replay_passes_min=min(
+                genome.consolidation.replay_passes_min + 1,
+                genome.consolidation.replay_passes_max,
+            ),
+        )
+        return dataclasses.replace(
+            genome, hebbian=new_hebbian, consolidation=new_consolidation,
+        )
+
+    # UNKNOWN — no mutation; keep the genome as-is.
+    return genome

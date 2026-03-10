@@ -26,6 +26,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from collections import deque
 
 from .regularizer import Regularizer
 from .habit import HabitSystem
@@ -34,7 +35,7 @@ from .corrector import Corrector
 from .replay import ReplayEngine, ConsolidationReport
 from .transformer import Transformer
 from .decoder import Decoder
-from .genome import Genome
+from .genome import Genome, mutate_genome
 from .memory import Memory
 from .reinforcement import ReinforcementSystem
 from .surprise import SurpriseDetector
@@ -50,6 +51,9 @@ from .types_ import (
     PersonalityVector,
     ReinforcementSignal,
     ReinforcementType,
+    EpisodicRecord,
+    FailureRecord,
+    FailureMode,
 )
 from .weight_store import WeightStore
 
@@ -67,6 +71,7 @@ class TurnResult:
     neuromodulators: NeuromodulatorState | None = None
     prediction_error: float = 0.0
     thalamic_routing: dict[TransformerRegion, float] | None = None
+    cascade_active: bool = False
 
 
 class Model:
@@ -122,6 +127,11 @@ class Model:
         self._previous_traces: list[HebbianTrace] = []
         self._last_structured = None  # cached for soft-prompt anchoring
         self._session_active = False
+
+        # mortality tracking (death-and-replacement mechanism)
+        self._pending_failure_records: list[FailureRecord] = []
+        self._train_loss_buffer: list[float] = []
+        self._consecutive_fail_cycles: int = 0
 
         # gradient training support ------------------------------------------------
         # ensure all trainable tensors request gradients
@@ -244,7 +254,9 @@ class Model:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self._grad_params, grad_cfg.grad_clip_norm)
         self._optimizer.step()
-        return float(loss.item())
+        loss_val = float(loss.item())
+        self._train_loss_buffer.append(loss_val)
+        return loss_val
 
     def _online_train_batch(self, token_list: list[torch.Tensor]) -> float | None:
         """Perform one gradient step over a batch of sequences.
@@ -275,7 +287,9 @@ class Model:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self._grad_params, grad_cfg.grad_clip_norm)
         self._optimizer.step()
-        return float(loss.item())
+        loss_val = float(loss.item())
+        self._train_loss_buffer.append(loss_val)
+        return loss_val
 
     def _compute_lm_loss(self, token_ids: torch.Tensor) -> torch.Tensor | None:
         """Return raw cross-entropy loss tensor without stepping the optimizer.
@@ -353,6 +367,19 @@ class Model:
         self._consolidation_meta["total_sessions"] += 1
         self._consolidation_meta["total_consolidations"] += 1
         self._save_state()
+
+        # mortality check: evaluate this cycle and possibly trigger death
+        if self._train_loss_buffer:
+            cycle_loss = sum(self._train_loss_buffer) / len(self._train_loss_buffer)
+            mort = self._genome.mortality
+            if cycle_loss > mort.cycle_loss_threshold:
+                self._consecutive_fail_cycles += 1
+            else:
+                self._consecutive_fail_cycles = 0
+            self._train_loss_buffer = []
+            if self._consecutive_fail_cycles >= mort.consecutive_cycles:
+                self._execute_death_and_replacement()
+
         return report
 
     @staticmethod
@@ -404,6 +431,8 @@ class Model:
         reinforcement_strength = sum(s.strength for s in ctx_input.reinforcement_signals)
         neuromod = self.reinforcement.neuromodulators
 
+        # catastrophic cascade is managed automatically by NeuromodulatorManager.update()
+
         # Neuromodulatory gain: norepinephrine drives transformer sharpening
         self.transformer.set_neuromodulatory_gain(
             norepinephrine=neuromod.norepinephrine, surprise=surprise_score,
@@ -449,7 +478,7 @@ class Model:
                 _max_tokens = 48
             else:                # adulthood
                 _max_tokens = 64
-            generated_tokens = self.generation.generate_sequence(
+            generated_tokens = self.decoder.generate_sequence(
                 combined_logits,
                 self.reinforcement.mood,
                 surprise_score,
@@ -476,7 +505,7 @@ class Model:
             acetylcholine=neuromod.acetylcholine,
         )
 
-        partial_applied = self.generation.partial_weight_update(
+        partial_applied = self.decoder.partial_weight_update(
             self.transformer,
             self._previous_traces,
             reinforcement_strength,
@@ -517,6 +546,7 @@ class Model:
             neuromodulators=neuromod,
             prediction_error=pred_error,
             thalamic_routing=routing_weights,
+            cascade_active=self.reinforcement.cascade_active,
         )
 
     def prepare_turn(self, user_text: str) -> tuple[torch.Tensor, list, float, float]:
@@ -545,6 +575,8 @@ class Model:
         )
         reinforcement_strength = sum(s.strength for s in ctx_input.reinforcement_signals)
         neuromod = self.reinforcement.neuromodulators
+
+        # catastrophic cascade is managed automatically by NeuromodulatorManager.update()
 
         # Neuromodulatory gain
         self.transformer.set_neuromodulatory_gain(
@@ -598,12 +630,14 @@ class Model:
         generated_tokens: list[int],
         traces: list,
         surprise_score: float,
-        reinforcement_strength: float,
+        reinforcement_strength: float
     ) -> None:
         assert self.reinforcement is not None
         assert self.memory is not None
 
         neuromod = self.reinforcement.neuromodulators
+
+        # catastrophic cascade is managed automatically by NeuromodulatorManager.update()
 
         plasticity_rates = self.adaptation_system.all_rates(
             self._developmental_age,
@@ -661,6 +695,88 @@ class Model:
         total += int(self.corrector.W_in.numel())
         total += int(self.corrector.W_out.numel())
         return total
+
+    def _classify_failure_mode(self, recent_losses: list[float]) -> FailureMode:
+        '''Infer why the instance failed from its loss trajectory.'''
+        if len(recent_losses) < 3:
+            return FailureMode.UNKNOWN
+        # Peak loss in first half vs second half: if second half is higher =
+        # catastrophic forgetting (was doing OK, then collapsed)
+        mid = len(recent_losses) // 2
+        first_avg = sum(recent_losses[:mid]) / mid
+        second_avg = sum(recent_losses[mid:]) / (len(recent_losses) - mid)
+        if second_avg > first_avg * 1.25:
+            return FailureMode.CATASTROPHIC_FORGETTING
+        # Consistently high loss from the start = never learned
+        if first_avg > self._genome.mortality.cycle_loss_threshold * 1.2:
+            return FailureMode.NEVER_LEARNED
+        # Otherwise likely stuck in repetitive output loops
+        return FailureMode.REPETITIVE_OUTPUT
+
+    def _failure_record_to_episodics(
+        self, rec: FailureRecord
+    ) -> list[EpisodicRecord]:
+        '''Convert a FailureRecord into high-priority EpisodicRecords for replay.'''
+        episodics = []
+        for token_ids_list in rec.failure_token_ids:
+            import torch as _torch
+            token_ids = _torch.tensor(token_ids_list, dtype=_torch.long)
+            episodic = EpisodicRecord(
+                token_ids=token_ids,
+                hebbian_traces=[],
+                surprise_score=1.0,          # treat as maximally surprising
+                mood_at_event=self._mood_baseline,
+                reinforcement=-1.0,          # strong negative signal
+                interaction_number=rec.predecessor_age,
+                repetition_count=0,
+                prediction_error=1.0,
+                neuromodulators_at_event=rec.neuromodulators_at_death,
+            )
+            episodic.compute_priority()
+            episodics.append(episodic)
+        return episodics
+
+    def _execute_death_and_replacement(self) -> None:
+        '''Kill this configuration, record the failure, mutate genome, reset state.'''
+        recent = list(self._train_loss_buffer)
+        failure_mode = self._classify_failure_mode(recent)
+
+        # Gather the most surprising/failing token sequences as post-mortem data
+        failure_token_ids: list[list[int]] = []
+        if self.memory is not None:
+            records = list(self.memory.drain())
+            # Sort by consolidation_priority (highest first) and take top 5
+            records.sort(key=lambda r: r.consolidation_priority, reverse=True)
+            for rec in records[:5]:
+                failure_token_ids.append(rec.token_ids.tolist())
+
+        neuromod_snapshot = (
+            self.reinforcement.neuromodulators
+            if self.reinforcement else self._neuromodulator_baseline
+        )
+
+        failure_rec = FailureRecord(
+            failure_mode=failure_mode,
+            predecessor_age=self._developmental_age,
+            cycle_losses=recent,
+            neuromodulators_at_death=neuromod_snapshot,
+            failure_token_ids=failure_token_ids,
+        )
+
+        # Mutate genome so successor avoids the same failure pattern
+        self._genome = mutate_genome(self._genome, failure_rec)
+
+        # Queue the failure record to be injected into the next consolidation
+        self._pending_failure_records.append(failure_rec)
+
+        # Reset instance state — successor inherits weights but starts fresh
+        self._developmental_age = 0
+        self._personality = PersonalityVector()
+        self._mood_baseline = MoodState()
+        self._neuromodulator_baseline = NeuromodulatorState()
+        self._consecutive_fail_cycles = 0
+        self._train_loss_buffer = []
+
 
     # ------------------------------------------------------------------
     # Default Mode Network
@@ -724,6 +840,13 @@ class Model:
         records = []
         if self.memory:
             records = self.memory.drain()
+
+        # Inject pending failure episodics at maximum priority so successor
+        # replays the predecessor's failure patterns during consolidation
+        if self._pending_failure_records:
+            for frec in self._pending_failure_records:
+                records.extend(self._failure_record_to_episodics(frec))
+            self._pending_failure_records = []
 
         plasticity_rates = self.adaptation_system.all_rates(
             self._developmental_age,
@@ -842,7 +965,8 @@ class Model:
 
     def status(self) -> dict:
         mood = self.reinforcement.mood if self.reinforcement else self._mood_baseline
-        neuromod = self.reinforcement.neuromodulators if self.reinforcement else self._neuromodulator_baseline
+        neuromod = self.reinforcement.neuromodulators
+
         return {
             "developmental_age": self._developmental_age,
             "developmental_stage": self.developmental_stage,

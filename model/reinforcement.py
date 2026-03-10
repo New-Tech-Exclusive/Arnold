@@ -261,6 +261,7 @@ class NeuromodulatorManager:
         baseline: NeuromodulatorState | None = None,
     ) -> None:
         self._params = genome.neuromodulator
+        self._catastrophe = genome.catastrophe
         self.state = NeuromodulatorState(
             dopamine=baseline.dopamine if baseline else self._params.dopamine_baseline,
             serotonin=baseline.serotonin if baseline else self._params.serotonin_baseline,
@@ -269,6 +270,9 @@ class NeuromodulatorManager:
         )
         self._expected_reinforcement: float = 0.0  # running average
         self._expected_alpha: float = 0.1  # EMA smoothing
+        # --- Catastrophic cascade state ---
+        self._cascade_active: bool = False
+        self._cascade_intensity: float = 0.0
 
     def update(
         self,
@@ -320,7 +324,54 @@ class NeuromodulatorManager:
         self.state.norepinephrine += p.ne_decay * (ne_signal - self.state.norepinephrine)
 
         self.state.clamp()
+
+        # ----------------------------------------------------------------
+        # Catastrophic cascade
+        # Fires when severe negative reinforcement AND high prediction error
+        # occur together.  A confident wrong answer is categorically different
+        # from an uncertain wrong answer and deserves a qualitatively different
+        # response — not just larger gradient updates but a different internal
+        # state that persists across several subsequent turns.
+        # ----------------------------------------------------------------
+        cat = self._catastrophe
+        if not self._cascade_active:
+            if (
+                net_signal < -cat.reinforcement_threshold
+                and prediction_error_magnitude > cat.prediction_error_threshold
+            ):
+                self._cascade_active = True
+                self._cascade_intensity = 1.0
+        else:
+            # Decay the cascade each turn
+            self._cascade_intensity = max(
+                0.0, self._cascade_intensity - cat.decay_rate,
+            )
+            if self._cascade_intensity < cat.min_intensity:
+                self._cascade_active = False
+                self._cascade_intensity = 0.0
+
+        if self._cascade_active:
+            # Proportionally push all four neuromodulators toward their
+            # cascade extremes.  At intensity=1.0 (trigger turn) the push
+            # is total.  As intensity decays, normal values reassert.
+            t = self._cascade_intensity
+            self.state.norepinephrine += t * (cat.ne_target - self.state.norepinephrine)
+            self.state.dopamine += t * (cat.dopamine_target - self.state.dopamine)
+            self.state.acetylcholine += t * (cat.ach_target - self.state.acetylcholine)
+            self.state.serotonin += t * (cat.serotonin_target - self.state.serotonin)
+            self.state.clamp()
+
         return self.state
+
+    @property
+    def cascade_active(self) -> bool:
+        """True while the catastrophic cascade is in progress."""
+        return self._cascade_active
+
+    @property
+    def cascade_intensity(self) -> float:
+        """Current cascade intensity (1.0 on trigger, decays to 0)."""
+        return self._cascade_intensity
 
     def session_end_baseline(self) -> NeuromodulatorState:
         """Decayed neuromodulator baseline for next session."""
@@ -383,6 +434,15 @@ class ReinforcementSystem:
     @property
     def neuromodulators(self) -> NeuromodulatorState:
         return self.neuromodulator_manager.state
+
+    @property
+    def cascade_active(self) -> bool:
+        """True while the catastrophic cascade is mobilising the system."""
+        return self.neuromodulator_manager.cascade_active
+
+    @property
+    def cascade_intensity(self) -> float:
+        return self.neuromodulator_manager.cascade_intensity
 
     def session_end_baseline(self) -> MoodState:
         return self.mood_manager.session_end_baseline()

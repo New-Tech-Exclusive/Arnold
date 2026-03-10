@@ -40,6 +40,14 @@ class ReinforcementType(enum.Enum):
     TONE_REJECTION = "tone_rejection"
 
 
+class FailureMode(enum.Enum):
+    """How an instance died - used to direct genome mutation."""
+    REPETITIVE_OUTPUT = "repetitive_output"          # stuck in generation loops
+    CATASTROPHIC_FORGETTING = "catastrophic_forgetting"  # performed well then collapsed
+    NEVER_LEARNED = "never_learned"                  # loss never converged
+    UNKNOWN = "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Core data containers
 # ---------------------------------------------------------------------------
@@ -87,6 +95,27 @@ class NeuromodulatorState:
             arousal=self.norepinephrine,
             openness=self.acetylcholine,
         )
+
+    # ------------------------------------------------------------------
+    # specialized utilities for asymmetry features
+    # ------------------------------------------------------------------
+
+    def apply_catastrophe(self) -> None:
+        """Force neuromodulators to catastrophe values as described in docs."""
+        self.norepinephrine = 1.0
+        self.dopamine = -1.0
+        self.acetylcholine = 1.0
+        self.serotonin = 0.0
+        self.clamp()
+
+    def decay_toward_baseline(self, baseline: "NeuromodulatorState", rate: float) -> None:
+        """Move each signal a fraction `rate` toward its baseline value."""
+        self.dopamine += (baseline.dopamine - self.dopamine) * (1 - rate)
+        self.serotonin += (baseline.serotonin - self.serotonin) * (1 - rate)
+        self.acetylcholine += (baseline.acetylcholine - self.acetylcholine) * (1 - rate)
+        self.norepinephrine += (baseline.norepinephrine - self.norepinephrine) * (1 - rate)
+        self.clamp()
+
 
 
 @dataclass
@@ -168,6 +197,22 @@ class EpisodicRecord:
             + abs(self.reinforcement) * 0.5
             + self.repetition_count * 0.2
         )
+
+
+@dataclass
+class FailureRecord:
+    """Immutable postmortem from a death-replacement cycle.
+
+    Unlike EpisodicRecords, these are never pruned.  They persist across
+    instance boundaries and are replayed at maximum priority at the start
+    of the successor's first consolidation pass.
+    """
+    failure_mode: FailureMode
+    predecessor_age: int
+    cycle_losses: list[float]                    # rolling losses that triggered death
+    neuromodulators_at_death: NeuromodulatorState
+    failure_token_ids: list[list[int]] = field(default_factory=list)  # inputs causing peak loss
+    is_immutable: bool = True                    # never prune
 
 
 @dataclass

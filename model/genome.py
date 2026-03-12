@@ -23,7 +23,9 @@ class LayerTopology:
     embed_dim: int = 64
     encoder_hidden: int = 128
     transformer_hidden: int = 128
+    cortex_hidden: int = 128
     memory_capacity: int = 1024
+    hippocampus_capacity: int = 1024
     regions: tuple[TransformerRegion, ...] = (
         TransformerRegion.TEMPORAL,
         TransformerRegion.FRONTAL,

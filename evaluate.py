@@ -23,6 +23,9 @@ import sys
 from pathlib import Path
 from typing import Iterator
 
+# Prevent triton segfault (see pretrain.py for full explanation).
+sys.modules["triton"] = None
+
 import torch
 try:
     from torch.utils.tensorboard import SummaryWriter

@@ -14,6 +14,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+# triton crashes on import on some GPU/driver configurations (SIGSEGV in
+# triton/knobs.py via torch._dynamo -> has_triton_package).  This project
+# never calls torch.compile(), so blocking the import is safe and prevents
+# transformers' lazy-loaded masking_utils from pulling in a broken triton.
+# Must run BEFORE `import torch` so torch cannot lazily register a broken
+# triton module that setdefault would then refuse to overwrite.
+sys.modules["triton"] = None
+
 import numpy as np
 import torch
 
@@ -60,7 +68,7 @@ def _successful_exit() -> None:
 
 @dataclass
 class TrainingConfig:
-    dataset: str = "allenai/WildChat-1M"
+    dataset: str = "HuggingFaceFW/fineweb-edu"
     dataset_config: str | None = None
     split: str = "train"
     text_field: str | None = None
@@ -302,9 +310,6 @@ def pretrain(cfg: TrainingConfig) -> None:
     if cfg.resume and model.weight_store.exists():
         print(f"  Resuming from existing state in {storage_dir}")
         print(f"  Encoder frozen: {model.encoder.is_frozen}")
-        if model.encoder.is_frozen:
-            print("  Encoder is already frozen - skipping pretraining.")
-            return
     else:
         print("  New model - pretraining from scratch")
 
@@ -374,7 +379,7 @@ def pretrain(cfg: TrainingConfig) -> None:
         except Exception:
             pass  # scheduler is optional
 
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         print(
             f"  Running {cfg.gradient_steps} gradient fine-tuning steps"
@@ -456,6 +461,9 @@ def pretrain(cfg: TrainingConfig) -> None:
     dt = time.perf_counter() - t0
     print(f"  Pretraining complete in {dt:.1f}s  ({len(sequences) / max(dt, 1e-6):.0f} seq/s)")
     print(f"  Encoder frozen: {model.encoder.is_frozen}")
+    # report average loss to model for potential death detection
+    if avg_loss is not None:
+        model._record_session_loss(avg_loss)
 
     print(f"\n  Saving model state to {storage_dir} ...")
     model._save_state()
@@ -562,4 +570,5 @@ if __name__ == "__main__":
         raise SystemExit(0)
     cfg = TrainingConfig.from_args(args)
     pretrain(cfg)
+    _successful_exit()
     _successful_exit()

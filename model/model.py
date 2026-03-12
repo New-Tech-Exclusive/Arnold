@@ -20,13 +20,13 @@ Processing flow:
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from collections import deque
 
 from .regularizer import Regularizer
 from .habit import HabitSystem
@@ -37,7 +37,9 @@ from .transformer import Transformer
 from .decoder import Decoder
 from .genome import Genome, mutate_genome
 from .memory import Memory
+Hippocampus = Memory
 from .reinforcement import ReinforcementSystem
+LimbicSystem = ReinforcementSystem
 from .surprise import SurpriseDetector
 from .adaptation import AdaptationSystem
 from .tensor import DTYPE, get_device, seed_all
@@ -63,7 +65,7 @@ class TurnResult:
     """Everything produced by a single turn of processing."""
 
     generated_tokens: list[int]
-    surprise_score: float
+    novelty_score: float
     mood: MoodState
     reinforcement_strength: float
     partial_update_applied: bool
@@ -72,6 +74,219 @@ class TurnResult:
     prediction_error: float = 0.0
     thalamic_routing: dict[TransformerRegion, float] | None = None
     cascade_active: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Mortality Monitor
+# ---------------------------------------------------------------------------
+
+class MortalityMonitor:
+    """Tracks rolling per-cycle loss and detects death-worthy failure states.
+
+    An instance is considered dead when its rolling training loss stays above
+    `cycle_loss_threshold` for `consecutive_cycles` consolidation cycles in a
+    row.  A single bad session does not trigger death; sustained, unimproving
+    failure does.
+
+    Failure mode inference
+    ----------------------
+    - CATASTROPHIC_FORGETTING: early cycles had low loss, recent ones are high.
+    - NEVER_LEARNED: loss consistently high with low variance.
+    - REPETITIVE_OUTPUT: loss is moderate but cascades fired repeatedly
+      (tracked via `record_cascade()`).
+    - UNKNOWN: fallback.
+    """
+
+    def __init__(self, genome: Genome) -> None:
+        self._params = genome.mortality
+        self._cycle_losses: deque[float] = deque(maxlen=self._params.loss_window)
+        self._consecutive_failures: int = 0
+        self._high_loss_inputs: list[tuple[float, list[int]]] = []
+        self._cascade_count: int = 0   # cascades fired in current window
+
+    def record_cycle(
+        self,
+        loss: float,
+        high_loss_inputs: list[tuple[float, list[int]]] | None = None,
+    ) -> None:
+        """Record the average training loss for the just-completed cycle."""
+        self._cycle_losses.append(loss)
+        if high_loss_inputs:
+            self._high_loss_inputs.extend(high_loss_inputs)
+            self._high_loss_inputs.sort(key=lambda x: x[0], reverse=True)
+            self._high_loss_inputs = self._high_loss_inputs[:5]
+        if loss > self._params.cycle_loss_threshold:
+            self._consecutive_failures += 1
+        else:
+            self._consecutive_failures = 0
+
+    def record_cascade(self) -> None:
+        """Note that a catastrophic cascade fired this session."""
+        self._cascade_count += 1
+
+    def is_dying(self) -> bool:
+        """True when sustained failure warrants death-and-replacement."""
+        return self._consecutive_failures >= self._params.consecutive_cycles
+
+    def _infer_failure_mode(self) -> FailureMode:
+        losses = list(self._cycle_losses)
+        if not losses:
+            return FailureMode.UNKNOWN
+        # Catastrophic forgetting: began well, ended badly
+        if len(losses) >= 4:
+            early = sum(losses[:2]) / 2
+            late = sum(losses[-2:]) / 2
+            if late > early * 2.0 and early < self._params.cycle_loss_threshold:
+                return FailureMode.CATASTROPHIC_FORGETTING
+        # Never learned: consistently high loss, low variance
+        if len(losses) >= 3:
+            avg = sum(losses) / len(losses)
+            variance = sum((l - avg) ** 2 for l in losses) / len(losses)
+            if avg > self._params.cycle_loss_threshold and variance < 0.5:
+                return FailureMode.NEVER_LEARNED
+        # Repetitive output: many cascade firings but no improvement
+        if self._cascade_count >= 3:
+            return FailureMode.REPETITIVE_OUTPUT
+        return FailureMode.UNKNOWN
+
+    def build_failure_record(
+        self,
+        predecessor_age: int,
+        neuromodulators: NeuromodulatorState,
+    ) -> FailureRecord:
+        """Construct the immutable postmortem record before the instance dies."""
+        return FailureRecord(
+            failure_mode=self._infer_failure_mode(),
+            predecessor_age=predecessor_age,
+            cycle_losses=list(self._cycle_losses),
+            neuromodulators_at_death=neuromodulators,
+            failure_token_ids=[ids for _, ids in self._high_loss_inputs],
+        )
+
+    def reset(self, genome: Genome | None = None) -> None:
+        if genome is not None:
+            self._params = genome.mortality
+        self._consecutive_failures = 0
+        self._cycle_losses.clear()
+        self._high_loss_inputs.clear()
+        self._cascade_count = 0
+
+
+# ---------------------------------------------------------------------------
+# Thalamic routing stub
+# ---------------------------------------------------------------------------
+
+class Thalamus:
+    """Routes encoder embeddings to cortex regions via learned gating weights.
+
+    Initialises W_route and W_feedback matrices so that count_parameters()
+    works correctly.  The stub route() returns an empty dict, which causes
+    Transformer.forward to use its default routing weight of 1.0 for every
+    region — equivalent to no routing bias.
+    """
+
+    def __init__(self, genome: Genome) -> None:
+        topo = genome.topology
+        device = get_device()
+        n_regions = len(topo.regions)
+        self.W_route = torch.zeros(topo.embed_dim, n_regions, device=device, dtype=DTYPE)
+        self.W_feedback = torch.zeros(
+            topo.transformer_hidden, topo.embed_dim, device=device, dtype=DTYPE
+        )
+
+    def route(
+        self,
+        embeddings: torch.Tensor,
+        neuromod: NeuromodulatorState,
+        novelty_score: float,
+    ) -> dict[TransformerRegion, float]:
+        return {}  # empty → each region uses default weight 1.0
+
+    def receive_feedback(
+        self, region_hiddens: dict[TransformerRegion, torch.Tensor]
+    ) -> None:
+        pass
+
+    def get_weights(self) -> dict[str, torch.Tensor]:
+        return {"W_route": self.W_route, "W_feedback": self.W_feedback}
+
+    def set_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        if "W_route" in weights:
+            self.W_route = weights["W_route"]
+        if "W_feedback" in weights:
+            self.W_feedback = weights["W_feedback"]
+
+
+# ---------------------------------------------------------------------------
+# Cerebellar forward-model corrector stub
+# ---------------------------------------------------------------------------
+
+class Cerebellum:
+    """Forward-model corrector: pre-adjusts logits based on predicted outcome.
+
+    Stub: initialises W_in / W_out for parameter counting and passes logits
+    through unchanged until a learning rule is trained in.
+    """
+
+    def __init__(self, genome: Genome) -> None:
+        topo = genome.topology
+        device = get_device()
+        hidden = max(topo.transformer_hidden // 2, 1)
+        self.W_in = torch.zeros(topo.embed_dim, hidden, device=device, dtype=DTYPE)
+        self.W_out = torch.zeros(hidden, topo.vocab_size, device=device, dtype=DTYPE)
+
+    def pre_correct_logits(
+        self, logits: torch.Tensor, embeddings: torch.Tensor
+    ) -> torch.Tensor:
+        return logits  # pass-through until cerebellar learning is implemented
+
+    def train_step(self, embeddings: torch.Tensor, reinforcement: float) -> None:
+        pass
+
+    def get_weights(self) -> dict[str, torch.Tensor]:
+        return {"W_in": self.W_in, "W_out": self.W_out}
+
+    def set_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        if "W_in" in weights:
+            self.W_in = weights["W_in"]
+        if "W_out" in weights:
+            self.W_out = weights["W_out"]
+
+
+# ---------------------------------------------------------------------------
+# Astrocyte metabolic monitor stub
+# ---------------------------------------------------------------------------
+
+class Astrocyte:
+    """Tracks per-region firing activity and applies slow metabolic penalties.
+
+    Uses the same AstrocyteParams as the Regularizer module (genome.regularizer).
+    """
+
+    def __init__(self, genome: Genome) -> None:
+        self._params = genome.regularizer  # AstrocyteParams
+        self._usage: dict[TransformerRegion, float] = {}
+
+    def decay(self) -> None:
+        for r in self._usage:
+            self._usage[r] *= self._params.metabolic_decay
+
+    def apply_penalties(self, cortex: object) -> None:
+        pass  # stub: penalisation logic to be implemented
+
+    def record_activity(
+        self, region: TransformerRegion, fired_indices: torch.Tensor
+    ) -> None:
+        if region not in self._usage:
+            self._usage[region] = 0.0
+        if fired_indices.numel() > 0:
+            self._usage[region] += float(fired_indices.numel())
+
+    def get_usage(self) -> dict[TransformerRegion, torch.Tensor]:
+        return {r: torch.tensor([v], dtype=DTYPE) for r, v in self._usage.items()}
+
+    def set_usage(self, usage: dict[TransformerRegion, torch.Tensor]) -> None:
+        self._usage = {r: float(t.item()) for r, t in usage.items()}
 
 
 class Model:
@@ -118,6 +333,17 @@ class Model:
         self.corrector = Corrector(self._genome)
         self.regularizer = Regularizer(self._genome)
 
+        # Backwards compatibility and biological aliases
+        self.cortex = self.transformer
+        self.thalamus = self.router
+        self.cerebellum = self.corrector
+        self.astrocyte = self.regularizer
+        self.basal_ganglia = self.habit_system          # habit system = basal ganglia
+        self.plasticity_system = self.adaptation_system # adaptation = plasticity gating
+        self.generation = self.decoder                  # decoder = token generation
+        self.novelty_detector = self.surprise_detector  # surprise = novelty detection
+        self.consolidation_engine = self.replay_engine  # replay = consolidation
+
         self.reinforcement: ReinforcementSystem | None = None
         self.memory: Memory | None = None
 
@@ -128,10 +354,10 @@ class Model:
         self._last_structured = None  # cached for soft-prompt anchoring
         self._session_active = False
 
-        # mortality tracking (death-and-replacement mechanism)
+        # Mortality tracking (death-and-replacement)
+        self._mortality_monitor = MortalityMonitor(self._genome)
         self._pending_failure_records: list[FailureRecord] = []
         self._train_loss_buffer: list[float] = []
-        self._consecutive_fail_cycles: int = 0
 
         # gradient training support ------------------------------------------------
         # ensure all trainable tensors request gradients
@@ -157,7 +383,7 @@ class Model:
         """Gather all tensors that should receive gradient updates.
 
         This mirrors the various components' own `parameters()` helpers so an
-        optimizer can treat the entire model like a single model.
+        optimizer can treat the entire architecture like a single model.
         """
         params: list[torch.Tensor] = []
         params.extend(self.encoder.parameters())
@@ -175,7 +401,7 @@ class Model:
         """Return next-token logits for every position in *token_ids*.
 
         Uses the same parameters that inference uses — encoder causal
-        self-attention followed by each active transformer region's W_in →
+        self-attention followed by each active cortex region's W_in →
         W_hidden → W_out chain.  Gradients therefore flow into the weights
         that actually determine generation quality.
 
@@ -193,7 +419,7 @@ class Model:
         #  1. The encoder's hand-rolled softmax guards with 1e-12, which
         #     underflows to zero in fp16 → 0/0 = NaN.
         #  2. After Hebbian pretraining, encoder embeddings can reach magnitudes
-        #     in the millions.  Feeding those into transformer matmuls under fp16 AMP
+        #     in the millions.  Feeding those into cortex matmuls under fp16 AMP
         #     (max ≈ 65504) overflows to inf → NaN cross-entropy loss.
         # fp32 handles both cases correctly; this function is not the bottleneck.
         with torch.amp.autocast("cuda", enabled=False):
@@ -202,9 +428,9 @@ class Model:
             # (seq_len-1, embed_dim) — prediction inputs for positions 0..T-2
             x = structured.embeddings[:-1]
 
-            # Normalise the encoder output before the transformer.  Hebbian learning
+            # Normalise the encoder output before the cortex.  Hebbian learning
             # amplifies values through co-occurrence → syntax → attention chains;
-            # layer_norm brings them back to unit scale so the transformer matmuls
+            # layer_norm brings them back to unit scale so the cortex matmuls
             # operate in a numerically stable regime regardless of training phase.
             x = F.layer_norm(x, [x.shape[-1]])  # still (T-1, embed_dim)
 
@@ -213,12 +439,12 @@ class Model:
             combined: torch.Tensor | None = None
             n_regions = 0
             for region in active_regions:
-                m = self.transformer.regions.get(region)
+                m = self.cortex.regions.get(region)
                 if m is None:
                     continue
-                h = F.relu(x @ m.W_in)                                     # (T, transformer_hidden)
+                h = F.relu(x @ m.W_in)                                     # (T, cortex_hidden)
                 h = F.layer_norm(h, [h.shape[-1]], m._ln_scale, m._ln_bias)
-                h = F.relu(h @ m.W_hidden)                                 # (T, transformer_hidden)
+                h = F.relu(h @ m.W_hidden)                                 # (T, cortex_hidden)
                 # Accumulate incrementally: avoids holding all region logit
                 # tensors in memory simultaneously (each is T × vocab_size).
                 r_logits = h @ m.W_out                                     # (T, vocab_size)
@@ -254,9 +480,8 @@ class Model:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self._grad_params, grad_cfg.grad_clip_norm)
         self._optimizer.step()
-        loss_val = float(loss.item())
-        self._train_loss_buffer.append(loss_val)
-        return loss_val
+        self._train_loss_buffer.append(float(loss.item()))
+        return float(loss.item())
 
     def _online_train_batch(self, token_list: list[torch.Tensor]) -> float | None:
         """Perform one gradient step over a batch of sequences.
@@ -287,9 +512,8 @@ class Model:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self._grad_params, grad_cfg.grad_clip_norm)
         self._optimizer.step()
-        loss_val = float(loss.item())
-        self._train_loss_buffer.append(loss_val)
-        return loss_val
+        self._train_loss_buffer.append(float(loss.item()))
+        return float(loss.item())
 
     def _compute_lm_loss(self, token_ids: torch.Tensor) -> torch.Tensor | None:
         """Return raw cross-entropy loss tensor without stepping the optimizer.
@@ -324,12 +548,23 @@ class Model:
         self._ewc_scalars = {}
         self._save_state()
 
+    def _record_session_loss(self, avg_loss: float) -> None:
+        """Record the average training loss for the just-completed session.
+
+        Minimal implementation: append to the internal buffer for later analysis.
+        """
+        try:
+            self._train_loss_buffer.append(float(avg_loss))
+        except Exception:
+            # Silently ignore failures here; recording loss is best-effort
+            pass
+
     def session_start(self) -> None:
-        self.reinforcement = ReinforcementSystem(
+        self.limbic = LimbicSystem(
             self._genome, self._mood_baseline, self._neuromodulator_baseline,
         )
-        self.memory = Memory(self._genome)
-        self.memory.set_interaction_counter(self._developmental_age)
+        self.hippocampus = Hippocampus(self._genome)
+        self.hippocampus.set_interaction_counter(self._developmental_age)
 
         self._previous_model_text = None
         self._previous_traces = []
@@ -341,12 +576,15 @@ class Model:
 
         self._session_active = False
 
-        if self.reinforcement:
-            self._mood_baseline = self.reinforcement.session_end_baseline()
-            self._neuromodulator_baseline = self.reinforcement.session_end_neuromodulator_baseline()
+        if self.limbic:
+            self._mood_baseline = self.limbic.session_end_baseline()
+            self._neuromodulator_baseline = self.limbic.session_end_neuromodulator_baseline()
+            # Propagate cascade events to mortality monitor
+            if self.limbic.cascade_active:
+                self._mortality_monitor.record_cascade()
 
-        if self.memory:
-            self._developmental_age = self.memory.interaction_count
+        if self.hippocampus:
+            self._developmental_age = self.hippocampus.interaction_count
 
         # DMN phase: internal thought generation before consolidation
         try:
@@ -357,29 +595,21 @@ class Model:
         report = self._consolidate()
 
         # Astrocyte: decay usage counters and apply metabolic penalties
-        self.regularizer.decay()
+        self.astrocyte.decay()
         if self._developmental_age % self._genome.regularizer.update_interval == 0:
-            self.regularizer.apply_penalties(self.transformer)
+            self.astrocyte.apply_penalties(self.cortex)
 
         # Basal ganglia: decay unused habits
-        self.habit_system.decay_habits()
+        self.basal_ganglia.decay_habits()
 
         self._consolidation_meta["total_sessions"] += 1
         self._consolidation_meta["total_consolidations"] += 1
+
+        # Death-and-replacement check: sustained failure triggers instance cycle.
+        if self._mortality_monitor.is_dying():
+            self._execute_death_and_replacement()
+
         self._save_state()
-
-        # mortality check: evaluate this cycle and possibly trigger death
-        if self._train_loss_buffer:
-            cycle_loss = sum(self._train_loss_buffer) / len(self._train_loss_buffer)
-            mort = self._genome.mortality
-            if cycle_loss > mort.cycle_loss_threshold:
-                self._consecutive_fail_cycles += 1
-            else:
-                self._consecutive_fail_cycles = 0
-            self._train_loss_buffer = []
-            if self._consecutive_fail_cycles >= mort.consecutive_cycles:
-                self._execute_death_and_replacement()
-
         return report
 
     @staticmethod
@@ -407,8 +637,8 @@ class Model:
         external_reinforcement: float | None = None,
     ) -> TurnResult:
         assert self._session_active, "Call session_start() before processing turns"
-        assert self.reinforcement is not None
-        assert self.memory is not None
+        assert self.limbic is not None
+        assert self.hippocampus is not None
 
         token_ids = self._tokenize(user_text)
         structured = self.encoder.process(token_ids)
@@ -416,53 +646,51 @@ class Model:
         # Online encoder update: light Hebbian pass on this turn's tokens
         self.encoder.online_update(token_ids)
 
-        surprise_score = self.surprise_detector.score(structured, self.transformer.forward_readonly)
+        novelty_score = self.novelty_detector.score(structured, self.cortex.forward_readonly)
 
-        # Prediction error from transformer (unified with surprise via predictive coding)
-        pred_error = self.transformer.mean_prediction_error()
+        # Prediction error from cortex (unified with novelty via predictive coding)
+        pred_error = self.cortex.mean_prediction_error()
 
         forced_signals = self._forced_signals_from_reinforcement(external_reinforcement)
 
-        ctx_input = self.reinforcement.process(
+        ctx_input = self.limbic.process(
             structured, user_text, self._previous_model_text,
-            surprise_score, pred_error,
+            novelty_score, pred_error,
             forced_signals=forced_signals,
         )
         reinforcement_strength = sum(s.strength for s in ctx_input.reinforcement_signals)
-        neuromod = self.reinforcement.neuromodulators
+        neuromod = self.limbic.neuromodulators
 
-        # catastrophic cascade is managed automatically by NeuromodulatorManager.update()
-
-        # Neuromodulatory gain: norepinephrine drives transformer sharpening
-        self.transformer.set_neuromodulatory_gain(
-            norepinephrine=neuromod.norepinephrine, surprise=surprise_score,
+        # Neuromodulatory gain: norepinephrine drives cortex sharpening
+        self.cortex.set_neuromodulatory_gain(
+            norepinephrine=neuromod.norepinephrine, surprise=novelty_score,
         )
 
         # Thalamic routing: decide which regions get what
-        routing_weights = self.router.route(
-            structured.embeddings, neuromod, surprise_score,
+        routing_weights = self.thalamus.route(
+            structured.embeddings, neuromod, novelty_score,
         )
 
-        combined_logits, traces, activations = self.transformer.forward(
+        combined_logits, traces, activations = self.cortex.forward(
             ctx_input, self._personality, routing_weights,
         )
 
-        # Thalamic feedback from transformer output
+        # Thalamic feedback from cortex output
         region_hiddens = {r: a.hidden for r, a in activations.items()}
-        self.router.receive_feedback(region_hiddens)
+        self.thalamus.receive_feedback(region_hiddens)
 
         # Astrocyte: record activity
         for region, act in activations.items():
-            self.regularizer.record_activity(region, act.fired_indices)
+            self.astrocyte.record_activity(region, act.fired_indices)
 
-        # Corrector: pre-correct logits
-        combined_logits = self.corrector.pre_correct_logits(
+        # Cerebellum: pre-correct logits
+        combined_logits = self.cerebellum.pre_correct_logits(
             combined_logits, structured.embeddings,
         )
 
         # Basal ganglia: check for habituated shortcut
         context_emb = structured.embeddings.mean(dim=0)
-        habit_tokens = self.habit_system.check_habit(context_emb)
+        habit_tokens = self.basal_ganglia.check_habit(context_emb)
 
         if habit_tokens is not None:
             generated_tokens = habit_tokens
@@ -478,67 +706,67 @@ class Model:
                 _max_tokens = 48
             else:                # adulthood
                 _max_tokens = 64
-            generated_tokens = self.decoder.generate_sequence(
+            generated_tokens = self.generation.generate_sequence(
                 combined_logits,
-                self.reinforcement.mood,
-                surprise_score,
+                self.limbic.mood,
+                novelty_score,
                 max_tokens=_max_tokens,
                 encoder=self.encoder,
-                transformer=self.transformer,
+                transformer=self.cortex,
                 anchor_embeddings=structured.embeddings,
                 norepinephrine=neuromod.norepinephrine,
             )
 
-        self.memory.record(
+        self.hippocampus.record(
             token_ids=token_ids,
             traces=traces,
-            surprise_score=surprise_score,
-            mood=self.reinforcement.mood,
+            novelty_score=novelty_score,
+            mood=self.limbic.mood,
             reinforcement=reinforcement_strength,
         )
 
         # Plasticity rates gated by acetylcholine
-        plasticity_rates = self.adaptation_system.all_rates(
+        plasticity_rates = self.plasticity_system.all_rates(
             self._developmental_age,
-            self.reinforcement.mood,
+            self.limbic.mood,
             {r: float(s.mean().item()) for r, s in self._ewc_scalars.items()},
             acetylcholine=neuromod.acetylcholine,
         )
 
-        partial_applied = self.decoder.partial_weight_update(
-            self.transformer,
+        partial_applied = self.generation.partial_weight_update(
+            self.cortex,
             self._previous_traces,
             reinforcement_strength,
             plasticity_rates,
             self._ewc_scalars,
         )
 
-        # Corrector: update forward model with actual reinforcement
-        self.corrector.train_step(structured.embeddings, reinforcement_strength)
+        # Cerebellum: update forward model with actual reinforcement
+        self.cerebellum.train_step(structured.embeddings, reinforcement_strength)
 
         # Basal ganglia: record sequence for potential habit formation
-        self.habit_system.record_sequence(context_emb, generated_tokens, reinforcement_strength)
+        self.basal_ganglia.record_sequence(context_emb, generated_tokens, reinforcement_strength)
 
-        if self.memory.needs_consolidation:
+        if self.hippocampus.needs_consolidation:
             self._consolidate()
 
         # Periodic homeostatic synaptic scaling
         homeo = self._genome.homeostatic
         if self._developmental_age > 0 and self._developmental_age % homeo.update_interval == 0:
-            self.transformer.homeostatic_scale_all()
+            self.cortex.homeostatic_scale_all()
 
         self._previous_model_text = self._detokenize(generated_tokens)
         self._previous_traces = traces
         self._developmental_age += 1
-        region_weights = self.transformer.voter.compute_region_weights(self._personality)
+        region_weights = self.cortex.voter.compute_region_weights(self._personality)
 
         return TurnResult(
             generated_tokens=generated_tokens,
-            surprise_score=surprise_score,
+            novelty_score=novelty_score,
             mood=MoodState(
-                self.reinforcement.mood.valence,
-                self.reinforcement.mood.arousal,
-                self.reinforcement.mood.openness,
+                self.limbic.mood.valence,
+                self.limbic.mood.arousal,
+                self.limbic.mood.openness,
             ),
             reinforcement_strength=reinforcement_strength,
             partial_update_applied=partial_applied,
@@ -546,19 +774,19 @@ class Model:
             neuromodulators=neuromod,
             prediction_error=pred_error,
             thalamic_routing=routing_weights,
-            cascade_active=self.reinforcement.cascade_active,
+            cascade_active=self.limbic.cascade_active,
         )
 
     def prepare_turn(self, user_text: str) -> tuple[torch.Tensor, list, float, float]:
         """Prepare a turn for streaming generation (used by chat_server).
 
-        Returns (logits, traces, surprise, reinforcement).
-        Side effects: thalamic routing, neuromodulator update, transformer forward,
-        memory record, corrector pre-correction, regularizer tracking.
+        Returns (logits, traces, novelty, reinforcement).
+        Side effects: thalamic routing, neuromodulator update, cortex forward,
+        hippocampus record, cerebellum pre-correction, astrocyte tracking.
         """
         assert self._session_active, "Call session_start() before processing turns"
-        assert self.reinforcement is not None
-        assert self.memory is not None
+        assert self.limbic is not None
+        assert self.hippocampus is not None
 
         token_ids = self._tokenize(user_text)
         structured = self.encoder.process(token_ids)
@@ -566,50 +794,48 @@ class Model:
         # Online encoder update for streaming/chat-server path.
         self.encoder.online_update(token_ids)
 
-        surprise_score = self.surprise_detector.score(structured, self.transformer.forward_readonly)
-        pred_error = self.transformer.mean_prediction_error()
+        novelty_score = self.novelty_detector.score(structured, self.cortex.forward_readonly)
+        pred_error = self.cortex.mean_prediction_error()
 
-        ctx_input = self.reinforcement.process(
+        ctx_input = self.limbic.process(
             structured, user_text, self._previous_model_text,
-            surprise_score, pred_error,
+            novelty_score, pred_error,
         )
         reinforcement_strength = sum(s.strength for s in ctx_input.reinforcement_signals)
-        neuromod = self.reinforcement.neuromodulators
-
-        # catastrophic cascade is managed automatically by NeuromodulatorManager.update()
+        neuromod = self.limbic.neuromodulators
 
         # Neuromodulatory gain
-        self.transformer.set_neuromodulatory_gain(
-            norepinephrine=neuromod.norepinephrine, surprise=surprise_score,
+        self.cortex.set_neuromodulatory_gain(
+            norepinephrine=neuromod.norepinephrine, surprise=novelty_score,
         )
 
         # Thalamic routing
-        routing_weights = self.router.route(
-            structured.embeddings, neuromod, surprise_score,
+        routing_weights = self.thalamus.route(
+            structured.embeddings, neuromod, novelty_score,
         )
 
-        combined_logits, traces, activations = self.transformer.forward(
+        combined_logits, traces, activations = self.cortex.forward(
             ctx_input, self._personality, routing_weights,
         )
 
         # Thalamic feedback
         region_hiddens = {r: a.hidden for r, a in activations.items()}
-        self.router.receive_feedback(region_hiddens)
+        self.thalamus.receive_feedback(region_hiddens)
 
         # Astrocyte tracking
         for region, act in activations.items():
-            self.regularizer.record_activity(region, act.fired_indices)
+            self.astrocyte.record_activity(region, act.fired_indices)
 
-        # Corrector pre-correction
-        combined_logits = self.corrector.pre_correct_logits(
+        # Cerebellum pre-correction
+        combined_logits = self.cerebellum.pre_correct_logits(
             combined_logits, structured.embeddings,
         )
 
-        self.memory.record(
+        self.hippocampus.record(
             token_ids=token_ids,
             traces=traces,
-            surprise_score=surprise_score,
-            mood=self.reinforcement.mood,
+            novelty_score=novelty_score,
+            mood=self.limbic.mood,
             reinforcement=reinforcement_strength,
         )
 
@@ -623,51 +849,49 @@ class Model:
             except Exception:
                 pass  # training failures shouldn't break conversation
 
-        return combined_logits, traces, surprise_score, reinforcement_strength
+        return combined_logits, traces, novelty_score, reinforcement_strength
 
     def finalize_turn(
         self,
         generated_tokens: list[int],
         traces: list,
-        surprise_score: float,
-        reinforcement_strength: float
+        novelty_score: float,
+        reinforcement_strength: float,
     ) -> None:
-        assert self.reinforcement is not None
-        assert self.memory is not None
+        assert self.limbic is not None
+        assert self.hippocampus is not None
 
-        neuromod = self.reinforcement.neuromodulators
+        neuromod = self.limbic.neuromodulators
 
-        # catastrophic cascade is managed automatically by NeuromodulatorManager.update()
-
-        plasticity_rates = self.adaptation_system.all_rates(
+        plasticity_rates = self.plasticity_system.all_rates(
             self._developmental_age,
-            self.reinforcement.mood,
+            self.limbic.mood,
             {r: float(s.mean().item()) for r, s in self._ewc_scalars.items()},
             acetylcholine=neuromod.acetylcholine,
         )
 
-        signal = float(max(min(surprise_score * 0.4 + abs(reinforcement_strength) * 0.6, 1.0), 0.0))
+        signal = float(max(min(novelty_score * 0.4 + abs(reinforcement_strength) * 0.6, 1.0), 0.0))
 
         for trace in traces:
             region = trace.region
-            if region not in self.transformer.regions:
+            if region not in self.cortex.regions:
                 continue
             lr = plasticity_rates.get(region, 0.01) * signal * 0.08
             ewc = self._ewc_scalars.get(region)
             if ewc is not None and int(ewc.numel()) > 0:
                 lr *= float(max(min(1.0 - ewc.mean().item(), 1.0), 0.0))
-            self.transformer.regions[region].hebbian_update(trace, lr)
+            self.cortex.regions[region].hebbian_update(trace, lr)
 
-        # Corrector: update forward model with actual reinforcement
+        # Cerebellum: update forward model with actual reinforcement
         if self._last_structured is not None:
-            self.corrector.train_step(self._last_structured.embeddings, reinforcement_strength)
+            self.cerebellum.train_step(self._last_structured.embeddings, reinforcement_strength)
 
         # Basal ganglia: record sequence for habit formation
         if self._last_structured is not None:
             context_emb = self._last_structured.embeddings.mean(dim=0)
-            self.habit_system.record_sequence(context_emb, generated_tokens, reinforcement_strength)
+            self.basal_ganglia.record_sequence(context_emb, generated_tokens, reinforcement_strength)
 
-        if self.memory.needs_consolidation:
+        if self.hippocampus.needs_consolidation:
             self._consolidate()
 
         self._previous_model_text = self._detokenize(generated_tokens)
@@ -677,125 +901,98 @@ class Model:
         # Periodic homeostatic synaptic scaling
         homeo = self._genome.homeostatic
         if self._developmental_age > 0 and self._developmental_age % homeo.update_interval == 0:
-            self.transformer.homeostatic_scale_all()
+            self.cortex.homeostatic_scale_all()
 
     def count_parameters(self) -> int:
         total = 0
         for arr in self.encoder.get_weights().values():
             total += int(arr.numel())
-        for region_module in self.transformer.regions.values():
+        for region_module in self.cortex.regions.values():
             total += int(region_module.W_in.numel())
             total += int(region_module.W_hidden.numel())
             total += int(region_module.W_out.numel())
             total += int(region_module.W_recurrent.numel())
-        # Router
-        total += int(self.router.W_route.numel())
-        total += int(self.router.W_feedback.numel())
-        # Corrector
-        total += int(self.corrector.W_in.numel())
-        total += int(self.corrector.W_out.numel())
+        # Thalamus
+        total += int(self.thalamus.W_route.numel())
+        total += int(self.thalamus.W_feedback.numel())
+        # Cerebellum
+        total += int(self.cerebellum.W_in.numel())
+        total += int(self.cerebellum.W_out.numel())
         return total
-
-    def _classify_failure_mode(self, recent_losses: list[float]) -> FailureMode:
-        '''Infer why the instance failed from its loss trajectory.'''
-        if len(recent_losses) < 3:
-            return FailureMode.UNKNOWN
-        # Peak loss in first half vs second half: if second half is higher =
-        # catastrophic forgetting (was doing OK, then collapsed)
-        mid = len(recent_losses) // 2
-        first_avg = sum(recent_losses[:mid]) / mid
-        second_avg = sum(recent_losses[mid:]) / (len(recent_losses) - mid)
-        if second_avg > first_avg * 1.25:
-            return FailureMode.CATASTROPHIC_FORGETTING
-        # Consistently high loss from the start = never learned
-        if first_avg > self._genome.mortality.cycle_loss_threshold * 1.2:
-            return FailureMode.NEVER_LEARNED
-        # Otherwise likely stuck in repetitive output loops
-        return FailureMode.REPETITIVE_OUTPUT
-
-    def _failure_record_to_episodics(
-        self, rec: FailureRecord
-    ) -> list[EpisodicRecord]:
-        '''Convert a FailureRecord into high-priority EpisodicRecords for replay.'''
-        episodics = []
-        for token_ids_list in rec.failure_token_ids:
-            import torch as _torch
-            token_ids = _torch.tensor(token_ids_list, dtype=_torch.long)
-            episodic = EpisodicRecord(
-                token_ids=token_ids,
-                hebbian_traces=[],
-                surprise_score=1.0,          # treat as maximally surprising
-                mood_at_event=self._mood_baseline,
-                reinforcement=-1.0,          # strong negative signal
-                interaction_number=rec.predecessor_age,
-                repetition_count=0,
-                prediction_error=1.0,
-                neuromodulators_at_event=rec.neuromodulators_at_death,
-            )
-            episodic.compute_priority()
-            episodics.append(episodic)
-        return episodics
-
-    def _execute_death_and_replacement(self) -> None:
-        '''Kill this configuration, record the failure, mutate genome, reset state.'''
-        recent = list(self._train_loss_buffer)
-        failure_mode = self._classify_failure_mode(recent)
-
-        # Gather the most surprising/failing token sequences as post-mortem data
-        failure_token_ids: list[list[int]] = []
-        if self.memory is not None:
-            records = list(self.memory.drain())
-            # Sort by consolidation_priority (highest first) and take top 5
-            records.sort(key=lambda r: r.consolidation_priority, reverse=True)
-            for rec in records[:5]:
-                failure_token_ids.append(rec.token_ids.tolist())
-
-        neuromod_snapshot = (
-            self.reinforcement.neuromodulators
-            if self.reinforcement else self._neuromodulator_baseline
-        )
-
-        failure_rec = FailureRecord(
-            failure_mode=failure_mode,
-            predecessor_age=self._developmental_age,
-            cycle_losses=recent,
-            neuromodulators_at_death=neuromod_snapshot,
-            failure_token_ids=failure_token_ids,
-        )
-
-        # Mutate genome so successor avoids the same failure pattern
-        self._genome = mutate_genome(self._genome, failure_rec)
-
-        # Queue the failure record to be injected into the next consolidation
-        self._pending_failure_records.append(failure_rec)
-
-        # Reset instance state — successor inherits weights but starts fresh
-        self._developmental_age = 0
-        self._personality = PersonalityVector()
-        self._mood_baseline = MoodState()
-        self._neuromodulator_baseline = NeuromodulatorState()
-        self._consecutive_fail_cycles = 0
-        self._train_loss_buffer = []
-
 
     # ------------------------------------------------------------------
     # Default Mode Network
     # ------------------------------------------------------------------
 
+    def _failure_record_to_episodics(self, fr: FailureRecord) -> list[EpisodicRecord]:
+        """Convert a FailureRecord into EpisodicRecords for consolidation replay.
+
+        Failure experiences are injected at maximum priority and with maximum
+        negative reinforcement so the consolidation engine treats them as the
+        single most important thing to learn from.
+        """
+        result = []
+        for token_ids_list in fr.failure_token_ids:
+            if not token_ids_list:
+                continue
+            tids = torch.tensor(token_ids_list, dtype=torch.long)
+            rec = EpisodicRecord(
+                token_ids=tids,
+                hebbian_traces=[],
+                novelty_score=1.0,
+                mood_at_event=MoodState(valence=-1.0, arousal=1.0, openness=0.8),
+                reinforcement=-1.0,
+                interaction_number=fr.predecessor_age,
+                repetition_count=0,
+                consolidation_priority=1.0,
+                prediction_error=1.0,
+                neuromodulators_at_event=fr.neuromodulators_at_death,
+            )
+            result.append(rec)
+        return result
+
+    def _execute_death_and_replacement(self) -> None:
+        """Terminate the current instance configuration and spawn a successor.
+
+        The successor inherits all weights unchanged.  What changes is:
+          1. The failure record (immutable memory) is queued for the next
+             consolidation pass, so the successor wakes with knowledge of
+             what killed its predecessor.
+          2. The genome receives a small directional mutation based on the
+             identified failure mode, preventing the same mistake from
+             recurring across the lineage.
+          3. Mortality counters reset so the successor gets a clean slate.
+        """
+        neuromod = (
+            self.limbic.neuromodulators
+            if hasattr(self, "limbic") and self.limbic is not None
+            else self._neuromodulator_baseline
+        )
+        failure_record = self._mortality_monitor.build_failure_record(
+            predecessor_age=self._developmental_age,
+            neuromodulators=neuromod,
+        )
+        # Queue failure memory for the successor's first consolidation pass
+        self._pending_failure_records.append(failure_record)
+        # Mutate genome: small directional correction away from failure mode
+        self._genome = mutate_genome(self._genome, failure_record)
+        # Reset mortality tracking for the successor
+        self._mortality_monitor.reset(self._genome)
+
     def _run_dmn_phase(self) -> None:
         """DMN: internal thought generation between sessions.
 
         The model generates internal "thought" sequences not directed at
-        any external input.  These draw on recent memory buffer
+        any external input.  These draw on recent hippocampus buffer
         contents and explore associative connections.
 
         The Hebbian traces get added to the consolidation buffer.
         """
         dmn = self._genome.dmn
-        if self.memory is None or not self.memory.size:
+        if self.hippocampus is None or not self.hippocampus.size:
             return
 
-        recent = self.memory.peek()[:5]  # peek at top-5 recent experiences
+        recent = self.hippocampus.peek()[:5]  # peek at top-5 recent experiences
         if not recent:
             return
 
@@ -817,46 +1014,69 @@ class Model:
             valid = valid[valid < hidden.shape[0]]
             hidden[valid] = trace.activation_strengths[:valid.numel()]
 
-            # Project hidden back to embed space for transformer input
+            # Project hidden back to embed space for cortex input
             # Use first active region's W_in transpose as projection
             region = self._genome.topology.active_regions[0]
-            if region in self.transformer.regions:
-                W_in = self.transformer.regions[region].W_in
+            if region in self.cortex.regions:
+                W_in = self.cortex.regions[region].W_in
                 # pseudo-inverse projection
                 thought_emb = hidden[:W_in.shape[1]] @ W_in.T  # (embed_dim,)
                 thought_emb = thought_emb.unsqueeze(0)  # (1, embed_dim)
 
-                # Run transformer read-only to generate DMN traces
-                activations = self.transformer.forward_readonly(thought_emb)
+                # Run cortex read-only to generate DMN traces
+                activations = self.cortex.forward_readonly(thought_emb)
                 for r, act in activations.items():
-                    dmn_trace = self.transformer.regions[r].get_hebbian_trace()
+                    dmn_trace = self.cortex.regions[r].get_hebbian_trace()
                     if dmn_trace is not None:
                         # Apply DMN traces at reduced strength
-                        self.transformer.regions[r].hebbian_update(
+                        self.cortex.regions[r].hebbian_update(
                             dmn_trace, dmn.association_strength,
                         )
 
     def _consolidate(self) -> ConsolidationReport:
         records = []
-        if self.memory:
-            records = self.memory.drain()
+        if self.hippocampus:
+            records = self.hippocampus.drain()
 
-        # Inject pending failure episodics at maximum priority so successor
-        # replays the predecessor's failure patterns during consolidation
+        # Inject pending immutable failure records from a predecessor death.
+        # These replay at maximum priority so the successor wakes from its
+        # first sleep already knowing what killed the prior instance.
         if self._pending_failure_records:
-            for frec in self._pending_failure_records:
-                records.extend(self._failure_record_to_episodics(frec))
-            self._pending_failure_records = []
+            failure_episodics = []
+            for fr in self._pending_failure_records:
+                failure_episodics.extend(self._failure_record_to_episodics(fr))
+            records = failure_episodics + records
+            self._pending_failure_records.clear()
 
-        plasticity_rates = self.adaptation_system.all_rates(
+        # Track cycle loss for mortality monitoring.
+        if self._train_loss_buffer:
+            _cycle_loss = sum(self._train_loss_buffer) / len(self._train_loss_buffer)
+            self._train_loss_buffer.clear()
+        elif records:
+            _neg = [r.reinforcement for r in records if r.reinforcement < 0]
+            _cycle_loss = (abs(sum(_neg) / len(_neg)) * 2.5) if _neg else 1.0
+        else:
+            _cycle_loss = 1.0
+
+        _high_loss = sorted(
+            [
+                (abs(r.reinforcement), r.token_ids.tolist())
+                for r in records
+                if r.reinforcement < -0.5 and not getattr(r, 'is_immutable', False)
+            ],
+            reverse=True,
+        )[:5]
+        self._mortality_monitor.record_cycle(_cycle_loss, _high_loss or None)
+
+        plasticity_rates = self.plasticity_system.all_rates(
             self._developmental_age,
             self._mood_baseline,
             {r: float(s.mean().item()) for r, s in self._ewc_scalars.items()},
         )
 
-        return self.replay_engine.run(
+        return self.consolidation_engine.run(
             records=records,
-            transformer=self.transformer,
+            transformer=self.cortex,
             ewc_scalars=self._ewc_scalars,
             personality=self._personality,
             plasticity_rates=plasticity_rates,
@@ -884,6 +1104,10 @@ class Model:
             regularizer_usage=self.regularizer.get_usage(),
             transformer_predictions=self.transformer.get_predictions(),
             habit_store=self.habit_system.get_state(),
+            thalamus_weights=self.thalamus.get_weights(),
+            cerebellum_weights=self.cerebellum.get_weights(),
+            astrocyte_usage=self.astrocyte.get_usage(),
+            cortex_predictions=self.transformer.get_predictions(),
         )
         self.weight_store.save(state, genome=self._genome, seed=self._seed)
 
@@ -908,29 +1132,29 @@ class Model:
         self._consolidation_meta = state.consolidation_meta or {}
 
         for key, strength in state.inter_region_highway.items():
-            if key in self.transformer.wiring.highway_strengths:
-                self.transformer.wiring.highway_strengths[key] = strength
+            if key in self.cortex.wiring.highway_strengths:
+                self.cortex.wiring.highway_strengths[key] = strength
 
         # Restore new component weights (backward compat: missing = keep random init)
         if state.neuromodulator_baseline is not None:
             self._neuromodulator_baseline = state.neuromodulator_baseline
-        if state.router_weights:
-            self.router.set_weights(state.router_weights)
-        if state.corrector_weights:
-            self.corrector.set_weights(state.corrector_weights)
-        if state.regularizer_usage:
-            self.regularizer.set_usage(state.regularizer_usage)
-        if state.transformer_predictions:
-            self.transformer.set_predictions(state.transformer_predictions)
+        if state.thalamus_weights:
+            self.thalamus.set_weights(state.thalamus_weights)
+        if state.cerebellum_weights:
+            self.cerebellum.set_weights(state.cerebellum_weights)
+        if state.astrocyte_usage:
+            self.astrocyte.set_usage(state.astrocyte_usage)
+        if state.cortex_predictions:
+            self.cortex.set_predictions(state.cortex_predictions)
         if state.habit_store:
-            self.habit_system.set_state(state.habit_store)
+            self.basal_ganglia.set_state(state.habit_store)
 
     def _tokenize(self, text: str) -> torch.Tensor:
         if self._tokenizer is not None:
             ids = self._tokenizer.encode(
                 text,
                 truncation=True,
-                max_length=self._genome.topology.memory_capacity,
+                max_length=self._genome.topology.hippocampus_capacity,
             )
             vocab = self._genome.topology.vocab_size
             if vocab > 0:
@@ -961,12 +1185,11 @@ class Model:
 
     @property
     def developmental_stage(self) -> str:
-        return self.adaptation_system.stage(self._developmental_age).value
+        return self.plasticity_system.stage(self._developmental_age).value
 
     def status(self) -> dict:
-        mood = self.reinforcement.mood if self.reinforcement else self._mood_baseline
-        neuromod = self.reinforcement.neuromodulators
-
+        mood = self.limbic.mood if self.limbic else self._mood_baseline
+        neuromod = self.limbic.neuromodulators if self.limbic else self._neuromodulator_baseline
         return {
             "developmental_age": self._developmental_age,
             "developmental_stage": self.developmental_stage,
@@ -985,10 +1208,10 @@ class Model:
                 "acetylcholine": round(neuromod.acetylcholine, 4),
                 "norepinephrine": round(neuromod.norepinephrine, 4),
             },
-            "plasticity": self.adaptation_system.describe(self._developmental_age, mood),
-            "memory_utilization": (
-                round(self.memory.utilization, 4)
-                if self.memory else 0.0
+            "plasticity": self.plasticity_system.describe(self._developmental_age, mood),
+            "hippocampus_utilization": (
+                round(self.hippocampus.utilization, 4)
+                if self.hippocampus else 0.0
             ),
             "session_active": self._session_active,
             "encoder_frozen": self.encoder.is_frozen,
@@ -996,11 +1219,11 @@ class Model:
             "region_weights": (
                 {
                     r.value: round(w, 4)
-                    for r, w in self.transformer.voter.compute_region_weights(self._personality).items()
+                    for r, w in self.cortex.voter.compute_region_weights(self._personality).items()
                 }
             ),
             "inter_region_highways": {
                 f"{r1.value}-{r2.value}": round(s, 6)
-                for (r1, r2), s in self.transformer.wiring.highway_strengths.items()
+                for (r1, r2), s in self.cortex.wiring.highway_strengths.items()
             },
         }

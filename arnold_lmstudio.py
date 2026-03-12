@@ -35,6 +35,9 @@ import sys
 import time
 from pathlib import Path
 
+# Prevent triton segfault (see pretrain.py for full explanation).
+sys.modules["triton"] = None
+
 try:
     import requests
 except ImportError:

@@ -9,7 +9,11 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
+
+# Prevent triton segfault (see pretrain.py for full explanation).
+sys.modules["triton"] = None
 
 import torch
 
@@ -115,7 +119,7 @@ def main() -> None:
     for i, user_msg in enumerate(conversation):
         print(f"\n  Turn {i + 1}: \"{user_msg[:60]}{'...' if len(user_msg) > 60 else ''}\"")
         result = model.process_turn(user_msg)
-        print(f"    Novelty:       {result.surprise_score:.3f}")
+        print(f"    Novelty:       {result.novelty_score:.3f}")
         print(f"    Mood:          v={result.mood.valence:+.3f}  "
               f"a={result.mood.arousal:.3f}  o={result.mood.openness:.3f}")
         print(f"    Reinforcement: {result.reinforcement_strength:+.3f}")
@@ -174,7 +178,7 @@ def main() -> None:
     for i, user_msg in enumerate(conversation2):
         print(f"\n  Turn {i + 1}: \"{user_msg[:60]}{'...' if len(user_msg) > 60 else ''}\"")
         result = model2.process_turn(user_msg)
-        print(f"    Novelty:       {result.surprise_score:.3f}")
+        print(f"    Novelty:       {result.novelty_score:.3f}")
         print(f"    Mood:          v={result.mood.valence:+.3f}  "
               f"a={result.mood.arousal:.3f}  o={result.mood.openness:.3f}")
         print(f"    Reinforcement: {result.reinforcement_strength:+.3f}")

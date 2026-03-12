@@ -41,7 +41,7 @@ class ReinforcementType(enum.Enum):
 
 
 class FailureMode(enum.Enum):
-    """How an instance died - used to direct genome mutation."""
+    """How an instance died — used to direct genome mutation."""
     REPETITIVE_OUTPUT = "repetitive_output"          # stuck in generation loops
     CATASTROPHIC_FORGETTING = "catastrophic_forgetting"  # performed well then collapsed
     NEVER_LEARNED = "never_learned"                  # loss never converged
@@ -96,27 +96,6 @@ class NeuromodulatorState:
             openness=self.acetylcholine,
         )
 
-    # ------------------------------------------------------------------
-    # specialized utilities for asymmetry features
-    # ------------------------------------------------------------------
-
-    def apply_catastrophe(self) -> None:
-        """Force neuromodulators to catastrophe values as described in docs."""
-        self.norepinephrine = 1.0
-        self.dopamine = -1.0
-        self.acetylcholine = 1.0
-        self.serotonin = 0.0
-        self.clamp()
-
-    def decay_toward_baseline(self, baseline: "NeuromodulatorState", rate: float) -> None:
-        """Move each signal a fraction `rate` toward its baseline value."""
-        self.dopamine += (baseline.dopamine - self.dopamine) * (1 - rate)
-        self.serotonin += (baseline.serotonin - self.serotonin) * (1 - rate)
-        self.acetylcholine += (baseline.acetylcholine - self.acetylcholine) * (1 - rate)
-        self.norepinephrine += (baseline.norepinephrine - self.norepinephrine) * (1 - rate)
-        self.clamp()
-
-
 
 @dataclass
 class PersonalityVector:
@@ -152,7 +131,7 @@ class ReinforcementSignal:
 
 @dataclass
 class StructuredRepresentation:
-    """Output of the brainstem — structured token representation."""
+    """Output of the encoder — structured token representation."""
     token_ids: torch.Tensor          # (seq_len,) int
     embeddings: torch.Tensor         # (seq_len, embed_dim)
     positional_encoding: torch.Tensor  # (seq_len, embed_dim)
@@ -161,7 +140,7 @@ class StructuredRepresentation:
 
 @dataclass
 class ContextualizedInput:
-    """Limbic-gate output — brainstem representation + emotional context."""
+    """Reinforcement-gate output — encoder representation + emotional context."""
     structured: StructuredRepresentation
     mood: MoodState
     reinforcement_signals: list[ReinforcementSignal]
@@ -179,10 +158,10 @@ class HebbianTrace:
 
 @dataclass
 class EpisodicRecord:
-    """One experience-buffer entry in the memory."""
+    """One experience-buffer entry in the hippocampus."""
     token_ids: torch.Tensor
     hebbian_traces: list[HebbianTrace]
-    surprise_score: float
+    novelty_score: float
     mood_at_event: MoodState
     reinforcement: float  # net scalar
     interaction_number: int
@@ -193,7 +172,7 @@ class EpisodicRecord:
 
     def compute_priority(self) -> None:
         self.consolidation_priority = (
-            self.surprise_score * 0.3
+            self.novelty_score * 0.3
             + abs(self.reinforcement) * 0.5
             + self.repetition_count * 0.2
         )
@@ -203,9 +182,9 @@ class EpisodicRecord:
 class FailureRecord:
     """Immutable postmortem from a death-replacement cycle.
 
-    Unlike EpisodicRecords, these are never pruned.  They persist across
-    instance boundaries and are replayed at maximum priority at the start
-    of the successor's first consolidation pass.
+    Unlike normal EpisodicRecords, these are never pruned.  They persist
+    across instance boundaries and are replayed at maximum priority at the
+    start of the successor's first consolidation pass.
     """
     failure_mode: FailureMode
     predecessor_age: int
@@ -245,3 +224,7 @@ class ModelState:
     regularizer_usage: dict[TransformerRegion, torch.Tensor] = field(default_factory=dict)
     transformer_predictions: dict[TransformerRegion, torch.Tensor] = field(default_factory=dict)
     habit_store: Optional[dict] = None
+    thalamus_weights: dict[str, torch.Tensor] = field(default_factory=dict)
+    cerebellum_weights: dict[str, torch.Tensor] = field(default_factory=dict)
+    astrocyte_usage: dict[TransformerRegion, torch.Tensor] = field(default_factory=dict)
+    cortex_predictions: dict[TransformerRegion, torch.Tensor] = field(default_factory=dict)

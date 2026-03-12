@@ -229,18 +229,19 @@ class ReplayEngine:
         """
         factor = self._genome.sleep.global_downscale_factor
 
-        for region in self._genome.topology.active_regions:
-            if region not in transformer.regions:
-                continue
-            mod = transformer.regions[region]
-            mod.W_in *= factor
-            mod.W_hidden *= factor
-            mod.W_out *= factor
-            mod.W_recurrent *= factor
+        with torch.no_grad():
+            for region in self._genome.topology.active_regions:
+                if region not in transformer.regions:
+                    continue
+                mod = transformer.regions[region]
+                mod.W_in *= factor
+                mod.W_hidden *= factor
+                mod.W_out *= factor
+                mod.W_recurrent *= factor
 
-        # Also downscale inter-region wiring
-        for key in transformer.wiring.connections:
-            transformer.wiring.connections[key] *= factor
+            # Also downscale inter-region wiring
+            for key in transformer.wiring.connections:
+                transformer.wiring.connections[key] *= factor
 
         report.global_downscale_applied = True
 
@@ -380,7 +381,7 @@ class ReplayEngine:
 
         # Aggregate statistics from records
         reinforcements = torch.tensor([r.reinforcement for r in records], dtype=DTYPE, device=get_device())
-        novelties = torch.tensor([r.surprise_score for r in records], dtype=DTYPE, device=get_device())
+        novelties = torch.tensor([r.novelty_score for r in records], dtype=DTYPE, device=get_device())
         valences = torch.tensor([r.mood_at_event.valence for r in records], dtype=DTYPE, device=get_device())
 
         mean_reinforcement = float(reinforcements.mean().item()) if int(reinforcements.numel()) > 0 else 0.0

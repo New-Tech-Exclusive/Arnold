@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+import sys
+
+# Prevent triton segfault (see pretrain.py for full explanation).
+sys.modules["triton"] = None
+
 from model.model import Model
 from model.genome import Genome, LayerTopology
 
@@ -21,7 +26,7 @@ def main() -> None:
     model.birth(pretraining_corpus=[])
     model.session_start()
     result = model.process_turn("hello world")
-    print(f"tokens={len(result.generated_tokens)} surprise={result.surprise_score:.4f}")
+    print(f"tokens={len(result.generated_tokens)} surprise={result.novelty_score:.4f}")
 
 
 if __name__ == "__main__":

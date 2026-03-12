@@ -16,6 +16,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
+
+# Prevent triton segfault (see pretrain.py for full explanation).
+sys.modules.setdefault("triton", None)
+
 import optuna
 import torch
 

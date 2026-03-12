@@ -46,8 +46,8 @@ class WeightStore:
                 vocab_size=topo_data.get("vocab_size", 30000),
                 embed_dim=topo_data.get("embed_dim", 64),
                 encoder_hidden=topo_data.get("encoder_hidden", 128),
-                transformer_hidden=topo_data.get("transformer_hidden", 128),
-                memory_capacity=topo_data.get("memory_capacity", 1024),
+                cortex_hidden=topo_data.get("cortex_hidden", 128),
+                hippocampus_capacity=topo_data.get("hippocampus_capacity", 1024),
             )
         except Exception:
             return None
@@ -69,7 +69,7 @@ class WeightStore:
 
         # Transformer weights
         for region, arr in state.transformer_weights.items():
-            tensors[f"transformer_{region.value}"] = arr.detach().cpu()
+            tensors[f"cortex_{region.value}"] = arr.detach().cpu()
 
         # Inter-region weights
         for (r1, r2), arr in state.inter_region_weights.items():
@@ -86,25 +86,25 @@ class WeightStore:
                 [state.plasticity_rates[k] for k in keys], dtype=torch.float64,
             )
 
-        # Router weights
-        if state.router_weights:
-            for name, arr in state.router_weights.items():
-                tensors[f"router_{name}"] = arr.detach().cpu()
+        # Thalamus weights
+        if state.thalamus_weights:
+            for name, arr in state.thalamus_weights.items():
+                tensors[f"thalamus_{name}"] = arr.detach().cpu()
 
-        # Corrector weights
-        if state.corrector_weights:
-            for name, arr in state.corrector_weights.items():
-                tensors[f"corrector_{name}"] = arr.detach().cpu()
+        # Cerebellum weights
+        if state.cerebellum_weights:
+            for name, arr in state.cerebellum_weights.items():
+                tensors[f"cerebellum_{name}"] = arr.detach().cpu()
 
         # Astrocyte usage counters
-        if state.regularizer_usage:
-            for region, arr in state.regularizer_usage.items():
-                tensors[f"regularizer_{region.value}"] = arr.detach().cpu()
+        if state.astrocyte_usage:
+            for region, arr in state.astrocyte_usage.items():
+                tensors[f"astrocyte_{region.value}"] = arr.detach().cpu()
 
         # Transformer predictions (predictive coding)
-        if state.transformer_predictions:
-            for region, arr in state.transformer_predictions.items():
-                tensors[f"transformerpred_{region.value}"] = arr.detach().cpu()
+        if state.cortex_predictions:
+            for region, arr in state.cortex_predictions.items():
+                tensors[f"cortexpred_{region.value}"] = arr.detach().cpu()
 
         # Write atomically; torch.save is much faster than np.savez_compressed
         # for large tensors (no zlib overhead).
@@ -170,8 +170,8 @@ class WeightStore:
                 "vocab_size": t.vocab_size,
                 "embed_dim": t.embed_dim,
                 "encoder_hidden": t.encoder_hidden,
-                "transformer_hidden": t.transformer_hidden,
-                "memory_capacity": t.memory_capacity,
+                "cortex_hidden": t.cortex_hidden,
+                "hippocampus_capacity": t.hippocampus_capacity,
             }
 
         with tempfile.NamedTemporaryFile(
@@ -219,8 +219,8 @@ class WeightStore:
             for key, tensor in data_items.items():
                 if key.startswith("encoder_"):
                     state.encoder_weights[key[len("encoder_"):]] = tensor
-                elif key.startswith("transformer_"):
-                    state.transformer_weights[TransformerRegion(key[len("transformer_"):])] = tensor
+                elif key.startswith("cortex_"):
+                    state.transformer_weights[TransformerRegion(key[len("cortex_"):])] = tensor
                 elif key.startswith("interregion_"):
                     parts = key[len("interregion_"):].split("_", 1)
                     if len(parts) == 2:
@@ -229,18 +229,18 @@ class WeightStore:
                         ] = tensor
                 elif key.startswith("ewc_"):
                     state.ewc_protection[TransformerRegion(key[len("ewc_"):])] = tensor
-                elif key.startswith("router_"):
-                    state.router_weights[key[len("router_"):]] = tensor
-                elif key.startswith("corrector_"):
-                    state.corrector_weights[key[len("corrector_"):]] = tensor
-                elif key.startswith("regularizer_"):
+                elif key.startswith("thalamus_"):
+                    state.thalamus_weights[key[len("thalamus_"):]] = tensor
+                elif key.startswith("cerebellum_"):
+                    state.cerebellum_weights[key[len("cerebellum_"):]] = tensor
+                elif key.startswith("astrocyte_"):
                     try:
-                        state.regularizer_usage[TransformerRegion(key[len("regularizer_"):])] = tensor
+                        state.astrocyte_usage[TransformerRegion(key[len("astrocyte_"):])] = tensor
                     except ValueError:
                         pass
-                elif key.startswith("transformerpred_"):
+                elif key.startswith("cortexpred_"):
                     try:
-                        state.transformer_predictions[TransformerRegion(key[len("transformerpred_"):])] = tensor
+                        state.cortex_predictions[TransformerRegion(key[len("cortexpred_"):])] = tensor
                     except ValueError:
                         pass
                 elif key == "plasticity_values":

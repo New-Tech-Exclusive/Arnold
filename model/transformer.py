@@ -188,7 +188,8 @@ class TransformerRegionModule:
         ratio = target / (self._avg_activation + 1e-8)
         # Clamp the adjustment to avoid wild jumps
         adjustment = 1.0 + factor * (ratio - 1.0).clamp(-1.0, 1.0)
-        self.W_in *= adjustment.unsqueeze(0)  # broadcast over input_dim
+        with torch.no_grad():
+            self.W_in *= adjustment.unsqueeze(0)  # broadcast over input_dim
 
     def get_hebbian_trace(self) -> HebbianTrace | None:
         if self._last_pre is None or self._last_post is None:
@@ -196,6 +197,20 @@ class TransformerRegionModule:
         # BCM: use per-neuron theta instead of fixed threshold
         pre_fired = torch.where(self._last_pre > self.theta[:self._last_pre.shape[0]])[0]
         post_fired = torch.where(self._last_post > self.theta)[0]
+
+        if pre_fired.numel() == 0 or post_fired.numel() == 0:
+            return None
+
+        pre_strengths = self._last_pre[pre_fired]
+        post_strengths = self._last_post[post_fired]
+        strengths = torch.outer(pre_strengths, post_strengths).reshape(-1)
+
+        return HebbianTrace(
+            region=self.region,
+            pre_indices=pre_fired,
+            post_indices=post_fired,
+            activation_strengths=strengths,
+        )
 
     # ------------------------------------------------------------------
     # Gradient helpers
@@ -211,19 +226,6 @@ class TransformerRegionModule:
             self._ln_scale,
             self._ln_bias,
         ]
-        if pre_fired.numel() == 0 or post_fired.numel() == 0:
-            return None
-
-        pre_strengths = self._last_pre[pre_fired]
-        post_strengths = self._last_post[post_fired]
-        strengths = torch.outer(pre_strengths, post_strengths).reshape(-1)
-
-        return HebbianTrace(
-            region=self.region,
-            pre_indices=pre_fired,
-            post_indices=post_fired,
-            activation_strengths=strengths,
-        )
 
     def hebbian_update(self, trace: HebbianTrace, learning_rate: float) -> None:
         """Oja's Rule: Δw = η · post · (pre - post · w).
@@ -237,67 +239,70 @@ class TransformerRegionModule:
         if n_post == 0:
             return
 
-        for i_idx, pre_i_t in enumerate(trace.pre_indices.tolist()):
-            pre_i = int(pre_i_t)
-            if pre_i >= self.hidden_dim:
-                continue
-
-            start = i_idx * n_post
-            pre_strength_slice = trace.activation_strengths[start:start + n_post]
-
-            for j_idx, post_j_t in enumerate(trace.post_indices.tolist()):
-                post_j = int(post_j_t)
-                if post_j >= self.hidden_dim:
+        with torch.no_grad():
+            for i_idx, pre_i_t in enumerate(trace.pre_indices.tolist()):
+                pre_i = int(pre_i_t)
+                if pre_i >= self.hidden_dim:
                     continue
 
-                pre_val = float(pre_strength_slice[j_idx]) if j_idx < pre_strength_slice.numel() else 0.0
-                post_val = float(self._last_post[post_j]) if self._last_post is not None else abs(pre_val)
-                w = float(self.W_hidden[pre_i, post_j])
+                start = i_idx * n_post
+                pre_strength_slice = trace.activation_strengths[start:start + n_post]
 
-                # Oja's Rule: Δw = η · post · (pre - post · w)
-                delta = learning_rate * post_val * (pre_val - post_val * w)
+                for j_idx, post_j_t in enumerate(trace.post_indices.tolist()):
+                    post_j = int(post_j_t)
+                    if post_j >= self.hidden_dim:
+                        continue
 
-                # BCM modulation: sign depends on post vs theta
-                theta_j = float(self.theta[post_j])
-                if post_val < theta_j:
-                    delta = -abs(delta)  # LTD: weaken
+                    pre_val = float(pre_strength_slice[j_idx]) if j_idx < pre_strength_slice.numel() else 0.0
+                    post_val = float(self._last_post[post_j]) if self._last_post is not None else abs(pre_val)
+                    w = float(self.W_hidden[pre_i, post_j])
 
-                self.W_hidden[pre_i, post_j] = max(
-                    params.min_weight,
-                    min(params.max_weight, w + delta),
-                )
+                    # Oja's Rule: Δw = η · post · (pre - post · w)
+                    delta = learning_rate * post_val * (pre_val - post_val * w)
+
+                    # BCM modulation: sign depends on post vs theta
+                    theta_j = float(self.theta[post_j])
+                    if post_val < theta_j:
+                        delta = -abs(delta)  # LTD: weaken
+
+                    self.W_hidden[pre_i, post_j] = max(
+                        params.min_weight,
+                        min(params.max_weight, w + delta),
+                    )
 
     def hebbian_update_batch(self, traces: list[HebbianTrace], learning_rate: float) -> None:
         """Batch Oja's Rule update across multiple traces."""
         params = self._genome.hebbian
 
-        for trace in traces:
-            if trace.region != self.region:
-                continue
-            n_post = int(trace.post_indices.numel())
-            for i_idx, pre_i_t in enumerate(trace.pre_indices.tolist()):
-                pre_i = int(pre_i_t)
-                for j_idx, post_j_t in enumerate(trace.post_indices.tolist()):
-                    post_j = int(post_j_t)
-                    flat_idx = i_idx * n_post + j_idx
-                    if flat_idx < trace.activation_strengths.numel():
-                        pre_val = float(trace.activation_strengths[flat_idx])
-                        w = float(self.W_hidden[pre_i, post_j])
-                        post_val = abs(pre_val)
-                        # Oja's Rule
-                        delta = learning_rate * post_val * (pre_val - post_val * w)
-                        theta_j = float(self.theta[post_j]) if post_j < self.theta.numel() else 0.3
-                        if post_val < theta_j:
-                            delta = -abs(delta)
-                        if pre_i < self.hidden_dim and post_j < self.hidden_dim:
-                            self.W_hidden[pre_i, post_j] += delta
+        with torch.no_grad():
+            for trace in traces:
+                if trace.region != self.region:
+                    continue
+                n_post = int(trace.post_indices.numel())
+                for i_idx, pre_i_t in enumerate(trace.pre_indices.tolist()):
+                    pre_i = int(pre_i_t)
+                    for j_idx, post_j_t in enumerate(trace.post_indices.tolist()):
+                        post_j = int(post_j_t)
+                        flat_idx = i_idx * n_post + j_idx
+                        if flat_idx < trace.activation_strengths.numel():
+                            pre_val = float(trace.activation_strengths[flat_idx])
+                            w = float(self.W_hidden[pre_i, post_j])
+                            post_val = abs(pre_val)
+                            # Oja's Rule
+                            delta = learning_rate * post_val * (pre_val - post_val * w)
+                            theta_j = float(self.theta[post_j]) if post_j < self.theta.numel() else 0.3
+                            if post_val < theta_j:
+                                delta = -abs(delta)
+                            if pre_i < self.hidden_dim and post_j < self.hidden_dim:
+                                self.W_hidden[pre_i, post_j] += delta
 
         self.W_hidden.clamp_(params.min_weight, params.max_weight)
 
     def apply_weight_decay(self, decay_rate: float) -> None:
-        self.W_in *= (1.0 - decay_rate)
-        self.W_hidden *= (1.0 - decay_rate)
-        self.W_out *= (1.0 - decay_rate)
+        with torch.no_grad():
+            self.W_in *= (1.0 - decay_rate)
+            self.W_hidden *= (1.0 - decay_rate)
+            self.W_out *= (1.0 - decay_rate)
 
     def prune(self, age_threshold: int, weight_threshold: float) -> int:
         stale_mask = self.last_fired > age_threshold
@@ -306,10 +311,11 @@ class TransformerRegionModule:
         pruned_count = int(prune_mask.sum().item())
 
         if pruned_count > 0:
-            self.W_hidden[prune_mask, :] = 0.0
-            self.W_hidden[:, prune_mask] = 0.0
-            self.W_in[:, prune_mask] = 0.0
-            self.W_out[prune_mask, :] = 0.0
+            with torch.no_grad():
+                self.W_hidden[prune_mask, :] = 0.0
+                self.W_hidden[:, prune_mask] = 0.0
+                self.W_in[:, prune_mask] = 0.0
+                self.W_out[prune_mask, :] = 0.0
 
         return pruned_count
 
@@ -376,7 +382,7 @@ class InterRegionWiring:
             modulations[r1] = modulations[r1] + mod_2_to_1 * (base_scale + stdp_scale)
             modulations[r2] = modulations[r2] + mod_1_to_2 * (base_scale - stdp_scale)
 
-            coactivation = float(torch.dot(h1, h2) / (torch.linalg.norm(h1) * torch.linalg.norm(h2) + 1e-12))
+            coactivation = float(torch.dot(h1.detach(), h2.detach()) / (torch.linalg.norm(h1.detach()) * torch.linalg.norm(h2.detach()) + 1e-12))
             self.highway_strengths[(r1, r2)] = 0.99 * self.highway_strengths[(r1, r2)] + 0.01 * coactivation
 
         return modulations
@@ -384,17 +390,18 @@ class InterRegionWiring:
     def hebbian_update(self, activations: dict[TransformerRegion, RegionActivation], learning_rate: float) -> None:
         """Oja's Rule for inter-region connections."""
         params = self._genome.hebbian
-        for (r1, r2), W in self.connections.items():
-            if r1 not in activations or r2 not in activations:
-                continue
-            h1 = activations[r1].hidden
-            h2 = activations[r2].hidden
-            # Oja: Δw = η · h2 · (h1 - h2 · W)^T  (column-wise normalisation)
-            outer = torch.outer(h1, h2)
-            norm_term = torch.outer(h2 @ W.T, h2)
-            delta = learning_rate * (outer - norm_term)
-            W += delta
-            W.clamp_(params.min_weight, params.max_weight)
+        with torch.no_grad():
+            for (r1, r2), W in self.connections.items():
+                if r1 not in activations or r2 not in activations:
+                    continue
+                h1 = activations[r1].hidden
+                h2 = activations[r2].hidden
+                # Oja: Δw = η · h2 · (h1 - h2 · W)^T  (column-wise normalisation)
+                outer = torch.outer(h1, h2)
+                norm_term = torch.outer(h2 @ W.T, h2)
+                delta = learning_rate * (outer - norm_term)
+                W += delta
+                W.clamp_(params.min_weight, params.max_weight)
 
     def get_highway_map(self) -> dict[tuple[TransformerRegion, TransformerRegion], float]:
         return dict(self.highway_strengths)

@@ -33,7 +33,7 @@ class Memory:
         self,
         token_ids: torch.Tensor,
         traces: list[HebbianTrace],
-        surprise_score: float,
+        novelty_score: float,
         mood: MoodState,
         reinforcement: float,
     ) -> EpisodicRecord:
@@ -46,7 +46,7 @@ class Memory:
         record = EpisodicRecord(
             token_ids=token_ids,
             hebbian_traces=traces,
-            surprise_score=surprise_score,
+            novelty_score=novelty_score,
             mood_at_event=MoodState(mood.valence, mood.arousal, mood.openness),
             reinforcement=reinforcement,
             interaction_number=self._interaction_counter,

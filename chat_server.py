@@ -30,7 +30,15 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
+
+# Block triton import: crashes on some GPU/driver configs (SIGSEGV in triton/knobs.py
+# via torch._dynamo -> has_triton_package). Not used here; blocking it is safe.
+sys.modules["triton"] = None
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 try:
     import torch
@@ -65,8 +73,8 @@ STATIC_DIR = _REPO / "static"
 # Global state
 # =============================================================================
 
-model: Model | None = None
-writer: SummaryWriter | None = None
+model = None
+writer = None
 gen_lock = asyncio.Lock()  # one generation at a time
 
 
@@ -267,15 +275,16 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
             # Soft prompt anchor from input embeddings
             anchor: torch.Tensor | None = None
             if model._last_structured is not None:
-                mean_emb = model._last_structured.embeddings.mean(dim=0).cpu()
-                anchor = bs.token_embeddings.cpu() @ mean_emb
+                mean_emb = model._last_structured.embeddings.mean(dim=0).detach().cpu()
+                anchor = bs.token_embeddings.detach().cpu() @ mean_emb
 
             # Recurrent weight from transformer
             W_rec: torch.Tensor | None = None
-            for region in model._genome.topology.active_regions:
-                if region in model.transformer.regions:
-                    W_rec = model.transformer.regions[region].W_recurrent.cpu()
-                    break
+            if hasattr(model.transformer, "regions"):
+                for region in model._genome.topology.active_regions:
+                    if region in model.transformer.regions:
+                        W_rec = model.transformer.regions[region].W_recurrent.detach().cpu()
+                        break
 
             t0 = time.perf_counter()
 
@@ -295,7 +304,7 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                                 step_logits[t_id] *= gen_params.repetition_penalty
 
                 # Also apply server-level rep penalty on top
-                lgt_np = step_logits.numpy()
+                lgt_np = step_logits.detach().cpu().numpy()
                 # Modulate temperature by norepinephrine: high NE → more exploration
                 effective_temp = req.temperature
                 if ne_value is not None:
@@ -318,11 +327,12 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                 emit({"token": text})
 
                 # --- Recurrent hidden state update ---
-                emb = bs.token_embeddings[tok_id].cpu()
-                co_hidden = torch.relu(emb @ bs.cooccurrence_weights.cpu())
+                emb = bs.token_embeddings[tok_id].detach().cpu()
+                co_hidden = torch.relu(emb @ bs.cooccurrence_weights.detach().cpu())
 
                 rec_input = co_hidden
                 if W_rec is not None:
+                    # hidden_state: (hidden_dim,), W_rec: (hidden_dim, hidden_dim)
                     rec_input = gen_params.recurrent_mix * (hidden_state @ W_rec) + (1.0 - gen_params.recurrent_mix) * co_hidden
                 hidden_state = torch.tanh(rec_input)
 
@@ -335,8 +345,8 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                     hidden_state = hidden_state + gen_params.context_attention_weight * context_vec
 
                 # Produce next logits from recurrent hidden state
-                recon = hidden_state @ bs.output_projection.cpu()
-                next_signal = bs.token_embeddings.cpu() @ recon
+                recon = hidden_state @ bs.output_projection.detach().cpu()
+                next_signal = bs.token_embeddings.detach().cpu() @ recon
                 current_logits = 0.50 * current_logits + 0.50 * next_signal
 
             dt = time.perf_counter() - t0

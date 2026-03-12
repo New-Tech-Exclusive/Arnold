@@ -1,0 +1,48 @@
+{
+  "personality": {
+    "curiosity": 0.5,
+    "warmth": 0.5,
+    "assertiveness": 0.5,
+    "creativity": 0.5,
+    "caution": 0.485,
+    "humor": 0.5
+  },
+  "seed": 42,
+  "mood_baseline": {
+    "valence": 0.0,
+    "arousal": 0.2,
+    "openness": 0.5
+  },
+  "developmental_age": 1,
+  "plasticity_rate_keys": [
+    "frontal",
+    "parietal",
+    "temporal"
+  ],
+  "consolidation_meta": {
+    "total_sessions": 1,
+    "total_consolidations": 1,
+    "avg_reinforcement": 0.0
+  },
+  "inter_region_highway": {
+    "temporal_frontal": 0.0,
+    "temporal_parietal": 0.0,
+    "frontal_parietal": 0.0
+  },
+  "neuromodulator_baseline": {
+    "dopamine": 0.0,
+    "serotonin": 0.5,
+    "acetylcholine": 0.3,
+    "norepinephrine": 0.3
+  },
+  "habit_store": {
+    "habits": []
+  },
+  "topology": {
+    "vocab_size": 256,
+    "embed_dim": 32,
+    "encoder_hidden": 64,
+    "cortex_hidden": 128,
+    "hippocampus_capacity": 1024
+  }
+}

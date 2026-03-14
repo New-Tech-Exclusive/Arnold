@@ -22,7 +22,9 @@ class SurpriseDetector:
         self._params = genome.surprise
         # Running EMA of raw prediction errors — prevents surprise saturating at 1.0
         # when untrained weights produce uniformly large errors.
-        self._error_ema: float = 2.0
+        self._error_ema: dict[TransformerRegion, float] = {
+            region: 2.0 for region in genome.topology.active_regions
+        }
 
     def score(
         self,
@@ -50,7 +52,7 @@ class SurpriseDetector:
 
         # For each active region, measure prediction confidence
         prediction_confidences: list[float] = []
-        raw_errors: list[float] = []
+        raw_errors: dict[TransformerRegion, float] = {}
 
         for region, act in activations.items():
             if region == TransformerRegion.OCCIPITAL:
@@ -60,8 +62,8 @@ class SurpriseDetector:
             # Normalize by running EMA baseline so untrained models (large uniform
             # errors) don't saturate surprise at 1.0 and pin NE at max forever.
             raw_err = max(act.prediction_error, 0.0)
-            raw_errors.append(raw_err)
-            normalized_err = raw_err / (self._error_ema + 1e-6)
+            raw_errors[region] = raw_err
+            normalized_err = raw_err / (self._error_ema.get(region, 2.0) + 1e-6)
             err_confidence = float(math.exp(-normalized_err))
 
             # --- Logit-based confidence (grows meaningful as W_out trains) ---
@@ -84,9 +86,9 @@ class SurpriseDetector:
             prediction_confidences.append(confidence)
 
         # Update EMA baseline from this call's prediction errors
-        if raw_errors:
-            batch_mean = sum(raw_errors) / len(raw_errors)
-            self._error_ema = 0.90 * self._error_ema + 0.10 * batch_mean
+        for region, batch_mean in raw_errors.items():
+            prev = self._error_ema.get(region, 2.0)
+            self._error_ema[region] = 0.90 * prev + 0.10 * batch_mean
 
         if not prediction_confidences:
             return 0.5  # no predictions → moderate surprise (not max, to avoid NE spike)

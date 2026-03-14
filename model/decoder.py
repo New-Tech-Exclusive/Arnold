@@ -172,10 +172,18 @@ class Decoder:
             # Transformer logits are a small learned correction on top of encoder base
             logits = base_logits + 0.05 * logits
 
+        primary_region = None
+        if transformer is not None:
+            for region in transformer._genome.topology.active_regions:
+                if region in transformer.regions:
+                    primary_region = transformer.regions[region]
+                    break
+
         # --- Recurrent hidden state ---
-        # Use encoder_hidden as the recurrent dimension
-        if encoder is not None:
-            hidden_dim = encoder.cooccurrence_weights.shape[1]  # encoder_hidden
+        if primary_region is not None:
+            hidden_dim = primary_region.hidden_dim
+        elif encoder is not None:
+            hidden_dim = encoder.cooccurrence_weights.shape[1]
         else:
             hidden_dim = logits.shape[0]
 
@@ -193,13 +201,10 @@ class Decoder:
 
         # Get recurrent weight from transformer (use first active region)
         W_rec: torch.Tensor | None = None
-        if transformer is not None:
-            for region in transformer._genome.topology.active_regions:
-                if region in transformer.regions:
-                    W_rec = transformer.regions[region].W_recurrent.to(device)
-                    break
+        if primary_region is not None:
+            W_rec = primary_region.W_recurrent.to(device)
 
-        for _ in range(max_tokens):
+        for step in range(max_tokens):
             # --- Apply soft prompt anchor ---
             step_logits = logits.clone()
             if anchor is not None:
@@ -218,7 +223,11 @@ class Decoder:
             # --- Update recurrent hidden state ---
             if encoder is not None:
                 emb = encoder.token_embeddings[token].to(device)  # (embed_dim,)
-                co_hidden = torch.relu(emb @ encoder.cooccurrence_weights.to(device))  # (hidden_dim,)
+                if primary_region is not None:
+                    co_hidden = torch.relu(emb @ primary_region.W_in.to(device))
+                    co_hidden = torch.relu(co_hidden @ primary_region.W_hidden.to(device))
+                else:
+                    co_hidden = torch.relu(emb @ encoder.cooccurrence_weights.to(device))
 
                 # Recurrent update: h = tanh(mix * W_rec @ h + (1-mix) * co_hidden)
                 rec_input = co_hidden
@@ -237,11 +246,16 @@ class Decoder:
                     hidden_state = hidden_state + gen.context_attention_weight * context_vec
 
                 # --- Produce next logits from hidden state ---
-                recon = hidden_state @ encoder.output_projection.to(device)  # (embed_dim,)
-                next_signal = encoder.token_embeddings.to(device) @ recon  # (vocab_size,)
+                if primary_region is not None:
+                    next_signal = hidden_state @ primary_region.W_out.to(device)
+                else:
+                    recon = hidden_state @ encoder.output_projection.to(device)
+                    next_signal = encoder.token_embeddings.to(device) @ recon
 
-                # Blend: 50% existing context, 50% recurrent next-token signal
-                logits = 0.50 * logits + 0.50 * next_signal
+                progress = step / max(max_tokens - 1, 1)
+                context_weight = 0.7 - 0.4 * progress
+                recurrent_weight = 0.3 + 0.4 * progress
+                logits = context_weight * logits + recurrent_weight * next_signal
             else:
                 logits = logits + torch.randn_like(logits, dtype=DTYPE) * 0.05
 

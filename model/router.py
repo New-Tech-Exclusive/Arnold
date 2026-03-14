@@ -75,7 +75,7 @@ class Router:
         # Build region weight map
         weights: dict[TransformerRegion, float] = {}
         for i, region in enumerate(self._regions):
-            weights[region] = float(routing_probs[i])
+            weights[region] = float(routing_probs[i].detach().item())
 
         return weights
 

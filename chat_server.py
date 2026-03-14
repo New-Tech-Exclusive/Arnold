@@ -268,7 +268,13 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
             vocab_size = current_logits.shape[0]
 
             bs = model.encoder
-            hidden_dim = bs.cooccurrence_weights.shape[1]
+            primary_region = None
+            for region in model._genome.topology.active_regions:
+                if region in model.transformer.regions:
+                    primary_region = model.transformer.regions[region]
+                    break
+
+            hidden_dim = primary_region.hidden_dim if primary_region is not None else bs.cooccurrence_weights.shape[1]
             hidden_state = torch.zeros(hidden_dim, dtype=current_logits.dtype)
             ctx_buf: deque[torch.Tensor] = deque(maxlen=gen_params.context_buffer_size)
 
@@ -280,15 +286,18 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
 
             # Recurrent weight from transformer
             W_rec: torch.Tensor | None = None
-            if hasattr(model.transformer, "regions"):
-                for region in model._genome.topology.active_regions:
-                    if region in model.transformer.regions:
-                        W_rec = model.transformer.regions[region].W_recurrent.detach().cpu()
-                        break
+            W_in: torch.Tensor | None = None
+            W_hidden: torch.Tensor | None = None
+            W_out: torch.Tensor | None = None
+            if primary_region is not None:
+                W_rec = primary_region.W_recurrent.detach().cpu()
+                W_in = primary_region.W_in.detach().cpu()
+                W_hidden = primary_region.W_hidden.detach().cpu()
+                W_out = primary_region.W_out.detach().cpu()
 
             t0 = time.perf_counter()
 
-            for _ in range(req.max_tokens):
+            for step in range(req.max_tokens):
                 # Apply anchor
                 step_logits = current_logits.clone()
                 if anchor is not None:
@@ -316,7 +325,6 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                     effective_temp,
                     req.top_k,
                     req.top_p,
-                    req.repetition_penalty,
                     np.random.default_rng(),
                 )
 
@@ -328,7 +336,11 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
 
                 # --- Recurrent hidden state update ---
                 emb = bs.token_embeddings[tok_id].detach().cpu()
-                co_hidden = torch.relu(emb @ bs.cooccurrence_weights.detach().cpu())
+                if W_in is not None and W_hidden is not None:
+                    co_hidden = torch.relu(emb @ W_in)
+                    co_hidden = torch.relu(co_hidden @ W_hidden)
+                else:
+                    co_hidden = torch.relu(emb @ bs.cooccurrence_weights.detach().cpu())
 
                 rec_input = co_hidden
                 if W_rec is not None:
@@ -345,9 +357,15 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                     hidden_state = hidden_state + gen_params.context_attention_weight * context_vec
 
                 # Produce next logits from recurrent hidden state
-                recon = hidden_state @ bs.output_projection.detach().cpu()
-                next_signal = bs.token_embeddings.detach().cpu() @ recon
-                current_logits = 0.50 * current_logits + 0.50 * next_signal
+                if W_out is not None:
+                    next_signal = hidden_state @ W_out
+                else:
+                    recon = hidden_state @ bs.output_projection.detach().cpu()
+                    next_signal = bs.token_embeddings.detach().cpu() @ recon
+                progress = step / max(req.max_tokens - 1, 1)
+                context_weight = 0.7 - 0.4 * progress
+                recurrent_weight = 0.3 + 0.4 * progress
+                current_logits = context_weight * current_logits + recurrent_weight * next_signal
 
             dt = time.perf_counter() - t0
             tok_s = len(generated_tokens) / max(dt, 1e-6)
@@ -414,18 +432,10 @@ def _sample(
     temperature: float,
     top_k: int,
     top_p: float,
-    rep_penalty: float,
     rng: np.random.Generator,
 ) -> int:
-    """Apply repetition penalty, temperature, top-k, top-p, then sample."""
+    """Apply temperature, top-k, top-p, then sample."""
     lgt = logits.copy()
-
-    # Repetition penalty
-    if rep_penalty != 1.0 and seen:
-        unique_seen = list(set(seen))
-        for t in unique_seen:
-            if 0 <= t < len(lgt):
-                lgt[t] /= rep_penalty
 
     # Temperature
     temp = max(temperature, 1e-8)

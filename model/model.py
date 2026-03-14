@@ -313,6 +313,7 @@ class Model:
         self._neuromodulator_baseline = NeuromodulatorState()
         self._developmental_age = 0
         self._ewc_scalars: dict[TransformerRegion, torch.Tensor] = {}
+        self._encoder_ewc_scalars: dict[str, torch.Tensor] = {}
         self._consolidation_meta: dict = {
             "total_sessions": 0,
             "total_consolidations": 0,
@@ -353,6 +354,7 @@ class Model:
         self._previous_traces: list[HebbianTrace] = []
         self._last_structured = None  # cached for soft-prompt anchoring
         self._session_active = False
+        self._session_token_buffer: list[torch.Tensor] = []
 
         # Mortality tracking (death-and-replacement)
         self._mortality_monitor = MortalityMonitor(self._genome)
@@ -397,64 +399,51 @@ class Model:
     # Gradient-based language modelling utilities
     # ------------------------------------------------------------------
 
+    def _compute_lm_region_logits(self, token_ids: torch.Tensor) -> dict[TransformerRegion, torch.Tensor]:
+        """Return next-token logits for each active region independently."""
+        token_ids = token_ids.to(device=get_device(), dtype=torch.long)
+        seq_len = int(token_ids.shape[0])
+        if seq_len < 2:
+            return {}
+
+        with torch.amp.autocast("cuda", enabled=False):
+            structured = self.encoder.process(token_ids)
+            x = F.layer_norm(structured.embeddings[:-1], [structured.embeddings.shape[-1]])
+
+            region_logits: dict[TransformerRegion, torch.Tensor] = {}
+            for region in self._genome.topology.active_regions:
+                m = self.cortex.regions.get(region)
+                if m is None:
+                    continue
+                h = F.relu(x @ m.W_in)
+                h = F.layer_norm(h, [h.shape[-1]], m._ln_scale, m._ln_bias)
+                h = F.relu(h @ m.W_hidden)
+                region_logits[region] = h @ m.W_out
+            return region_logits
+
     def _compute_lm_logits(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Return next-token logits for every position in *token_ids*.
-
-        Uses the same parameters that inference uses — encoder causal
-        self-attention followed by each active cortex region's W_in →
-        W_hidden → W_out chain.  Gradients therefore flow into the weights
-        that actually determine generation quality.
-
-        Does not mutate any Hebbian state (prediction buffers, firing counters,
-        etc.), so it is safe to call repeatedly during training.
-        """
+        """Return voter-combined next-token logits for every position."""
         token_ids = token_ids.to(device=get_device(), dtype=torch.long)
         seq_len = int(token_ids.shape[0])
         if seq_len < 2:
             return torch.empty((0, self._genome.topology.vocab_size), device=get_device())
 
-        # Run the entire forward pass in fp32, regardless of any outer autocast.
-        #
-        # Two reasons:
-        #  1. The encoder's hand-rolled softmax guards with 1e-12, which
-        #     underflows to zero in fp16 → 0/0 = NaN.
-        #  2. After Hebbian pretraining, encoder embeddings can reach magnitudes
-        #     in the millions.  Feeding those into cortex matmuls under fp16 AMP
-        #     (max ≈ 65504) overflows to inf → NaN cross-entropy loss.
-        # fp32 handles both cases correctly; this function is not the bottleneck.
-        with torch.amp.autocast("cuda", enabled=False):
-            # --- Encoder: causal self-attention (no Hebbian side effects) ---
-            structured = self.encoder.process(token_ids)
-            # (seq_len-1, embed_dim) — prediction inputs for positions 0..T-2
-            x = structured.embeddings[:-1]
-
-            # Normalise the encoder output before the cortex.  Hebbian learning
-            # amplifies values through co-occurrence → syntax → attention chains;
-            # layer_norm brings them back to unit scale so the cortex matmuls
-            # operate in a numerically stable regime regardless of training phase.
-            x = F.layer_norm(x, [x.shape[-1]])  # still (T-1, embed_dim)
-
-            # --- Transformer: W_in → layer_norm → W_hidden → W_out per region ---
-            active_regions = self._genome.topology.active_regions
+        region_logits = self._compute_lm_region_logits(token_ids)
+        if region_logits:
+            region_weights = self.cortex.voter.compute_region_weights(self._personality)
+            present = [region for region in region_logits if region in region_weights]
+            total_weight = sum(region_weights[region] for region in present) or 1.0
             combined: torch.Tensor | None = None
-            n_regions = 0
-            for region in active_regions:
-                m = self.cortex.regions.get(region)
-                if m is None:
-                    continue
-                h = F.relu(x @ m.W_in)                                     # (T, cortex_hidden)
-                h = F.layer_norm(h, [h.shape[-1]], m._ln_scale, m._ln_bias)
-                h = F.relu(h @ m.W_hidden)                                 # (T, cortex_hidden)
-                # Accumulate incrementally: avoids holding all region logit
-                # tensors in memory simultaneously (each is T × vocab_size).
-                r_logits = h @ m.W_out                                     # (T, vocab_size)
-                combined = r_logits if combined is None else combined + r_logits
-                n_regions += 1
-
+            for region in present:
+                weight = region_weights[region] / total_weight
+                logits = region_logits[region]
+                combined = logits * weight if combined is None else combined + logits * weight
             if combined is not None:
-                return combined / n_regions                                 # (T, vocab_size)
+                return combined
 
-            # Fallback: encoder embedding dot-product with vocab matrix
+        with torch.amp.autocast("cuda", enabled=False):
+            structured = self.encoder.process(token_ids)
+            x = F.layer_norm(structured.embeddings[:-1], [structured.embeddings.shape[-1]])
             return x @ self.encoder.token_embeddings.T
 
     def _online_train(self, token_ids: torch.Tensor) -> float | None:
@@ -470,12 +459,10 @@ class Model:
         """
         if self._optimizer is None or token_ids.numel() < 2:
             return None
-        logits = self._compute_lm_logits(token_ids)
-        if logits.numel() == 0:
+        loss = self._compute_lm_loss(token_ids)
+        if loss is None:
             return None
-        targets = token_ids[1: logits.shape[0] + 1].to(device=logits.device)
         grad_cfg = self._genome.gradient
-        loss = F.cross_entropy(logits, targets, label_smoothing=grad_cfg.label_smoothing)
         self._optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self._grad_params, grad_cfg.grad_clip_norm)
@@ -498,11 +485,9 @@ class Model:
         for token_ids in token_list:
             if token_ids.numel() < 2:
                 continue
-            logits = self._compute_lm_logits(token_ids)
-            if logits.numel() == 0:
+            seq_loss = self._compute_lm_loss(token_ids)
+            if seq_loss is None:
                 continue
-            targets = token_ids[1: logits.shape[0] + 1].to(device=logits.device)
-            seq_loss = F.cross_entropy(logits, targets, label_smoothing=grad_cfg.label_smoothing)
             total_loss = seq_loss if total_loss is None else total_loss + seq_loss
             count += 1
         if count == 0 or total_loss is None:
@@ -525,14 +510,96 @@ class Model:
         """
         if token_ids.numel() < 2:
             return None
+        grad_cfg = self._genome.gradient
+
+        token_ids = token_ids.to(device=get_device(), dtype=torch.long)
+        seq_len = int(token_ids.shape[0])
+        if seq_len >= 2:
+            with torch.amp.autocast("cuda", enabled=False):
+                structured = self.encoder.process(token_ids)
+                x = F.layer_norm(structured.embeddings[:-1], [structured.embeddings.shape[-1]])
+                targets = token_ids[1: x.shape[0] + 1].to(device=x.device)
+                region_weights = self.cortex.voter.compute_region_weights(self._personality)
+                total_weight = 0.0
+                weighted_loss: torch.Tensor | None = None
+
+                for region in self._genome.topology.active_regions:
+                    m = self.cortex.regions.get(region)
+                    if m is None:
+                        continue
+                    weight = float(region_weights.get(region, 0.0))
+                    if weight <= 0.0:
+                        continue
+
+                    h = F.relu(x @ m.W_in)
+                    h = F.layer_norm(h, [h.shape[-1]], m._ln_scale, m._ln_bias)
+                    h = F.relu(h @ m.W_hidden)
+                    logits = h @ m.W_out
+                    region_loss = F.cross_entropy(
+                        logits,
+                        targets,
+                        label_smoothing=grad_cfg.label_smoothing,
+                    )
+                    weighted_loss = region_loss * weight if weighted_loss is None else weighted_loss + region_loss * weight
+                    total_weight += weight
+
+                if weighted_loss is not None:
+                    return weighted_loss / max(total_weight, 1e-8)
+
         logits = self._compute_lm_logits(token_ids)
         if logits.numel() == 0:
             return None
         targets = token_ids[1: logits.shape[0] + 1].to(device=logits.device)
-        return F.cross_entropy(
-            logits, targets,
-            label_smoothing=self._genome.gradient.label_smoothing,
+        return F.cross_entropy(logits, targets, label_smoothing=grad_cfg.label_smoothing)
+
+    def _sleep_replay_train_step(self, token_ids: torch.Tensor, replay_scale: float = 1.0) -> float | None:
+        if self._optimizer is None or token_ids.numel() < 2:
+            return None
+        loss = self._compute_lm_loss(token_ids)
+        if loss is None:
+            return None
+        scaled_loss = loss * max(float(replay_scale), 0.1)
+        self._optimizer.zero_grad()
+        scaled_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self._grad_params, self._genome.gradient.grad_clip_norm)
+        self._optimizer.step()
+        self._train_loss_buffer.append(float(loss.item()))
+        return float(loss.item())
+
+    def _update_encoder_ewc(self) -> None:
+        params = self._genome.ewc
+
+        token_importance = self.encoder.token_embeddings.detach().abs().mean(dim=1)
+        token_importance = token_importance / torch.clamp(token_importance.max(), min=1e-8)
+        token_protection = torch.pow(token_importance, params.protection_exponent)
+        token_protection = torch.clamp(
+            token_protection * params.protection_growth_rate,
+            0.0,
+            params.max_protection,
         )
+
+        co_importance = self.encoder.cooccurrence_weights.detach().abs().mean(dim=0)
+        co_importance = co_importance / torch.clamp(co_importance.max(), min=1e-8)
+        co_protection = torch.pow(co_importance, params.protection_exponent)
+        co_protection = torch.clamp(
+            co_protection * params.protection_growth_rate,
+            0.0,
+            params.max_protection,
+        )
+
+        if "token_embeddings" in self._encoder_ewc_scalars and self._encoder_ewc_scalars["token_embeddings"].shape == token_protection.shape:
+            self._encoder_ewc_scalars["token_embeddings"] = torch.maximum(
+                self._encoder_ewc_scalars["token_embeddings"], token_protection,
+            )
+        else:
+            self._encoder_ewc_scalars["token_embeddings"] = token_protection
+
+        if "cooccurrence_weights" in self._encoder_ewc_scalars and self._encoder_ewc_scalars["cooccurrence_weights"].shape == co_protection.shape:
+            self._encoder_ewc_scalars["cooccurrence_weights"] = torch.maximum(
+                self._encoder_ewc_scalars["cooccurrence_weights"], co_protection,
+            )
+        else:
+            self._encoder_ewc_scalars["cooccurrence_weights"] = co_protection
 
     def birth(self, pretraining_corpus: list[torch.Tensor] | None = None) -> None:
         if pretraining_corpus:
@@ -546,6 +613,7 @@ class Model:
         self._mood_baseline = MoodState()
         self._developmental_age = 0
         self._ewc_scalars = {}
+        self._encoder_ewc_scalars = {}
         self._save_state()
 
     def _record_session_loss(self, avg_loss: float) -> None:
@@ -563,11 +631,14 @@ class Model:
         self.limbic = LimbicSystem(
             self._genome, self._mood_baseline, self._neuromodulator_baseline,
         )
+        self.reinforcement = self.limbic
         self.hippocampus = Hippocampus(self._genome)
+        self.memory = self.hippocampus
         self.hippocampus.set_interaction_counter(self._developmental_age)
 
         self._previous_model_text = None
         self._previous_traces = []
+        self._session_token_buffer = []
         self._session_active = True
 
     def session_end(self) -> ConsolidationReport | None:
@@ -585,6 +656,13 @@ class Model:
 
         if self.hippocampus:
             self._developmental_age = self.hippocampus.interaction_count
+
+        if self._session_token_buffer and self._optimizer is not None:
+            try:
+                self._online_train_batch(self._session_token_buffer)
+            except Exception:
+                pass
+        self._session_token_buffer = []
 
         # DMN phase: internal thought generation before consolidation
         try:
@@ -644,7 +722,8 @@ class Model:
         structured = self.encoder.process(token_ids)
 
         # Online encoder update: light Hebbian pass on this turn's tokens
-        self.encoder.online_update(token_ids)
+        self.encoder.online_update(token_ids, ewc_scalars=self._encoder_ewc_scalars)
+        self._session_token_buffer.append(token_ids.detach().cpu())
 
         novelty_score = self.novelty_detector.score(structured, self.cortex.forward_readonly)
 
@@ -682,11 +761,6 @@ class Model:
         # Astrocyte: record activity
         for region, act in activations.items():
             self.astrocyte.record_activity(region, act.fired_indices)
-
-        # Cerebellum: pre-correct logits
-        combined_logits = self.cerebellum.pre_correct_logits(
-            combined_logits, structured.embeddings,
-        )
 
         # Basal ganglia: check for habituated shortcut
         context_emb = structured.embeddings.mean(dim=0)
@@ -741,9 +815,6 @@ class Model:
             self._ewc_scalars,
         )
 
-        # Cerebellum: update forward model with actual reinforcement
-        self.cerebellum.train_step(structured.embeddings, reinforcement_strength)
-
         # Basal ganglia: record sequence for potential habit formation
         self.basal_ganglia.record_sequence(context_emb, generated_tokens, reinforcement_strength)
 
@@ -792,7 +863,8 @@ class Model:
         structured = self.encoder.process(token_ids)
 
         # Online encoder update for streaming/chat-server path.
-        self.encoder.online_update(token_ids)
+        self.encoder.online_update(token_ids, ewc_scalars=self._encoder_ewc_scalars)
+        self._session_token_buffer.append(token_ids.detach().cpu())
 
         novelty_score = self.novelty_detector.score(structured, self.cortex.forward_readonly)
         pred_error = self.cortex.mean_prediction_error()
@@ -825,11 +897,6 @@ class Model:
         # Astrocyte tracking
         for region, act in activations.items():
             self.astrocyte.record_activity(region, act.fired_indices)
-
-        # Cerebellum pre-correction
-        combined_logits = self.cerebellum.pre_correct_logits(
-            combined_logits, structured.embeddings,
-        )
 
         self.hippocampus.record(
             token_ids=token_ids,
@@ -881,10 +948,6 @@ class Model:
             if ewc is not None and int(ewc.numel()) > 0:
                 lr *= float(max(min(1.0 - ewc.mean().item(), 1.0), 0.0))
             self.cortex.regions[region].hebbian_update(trace, lr)
-
-        # Cerebellum: update forward model with actual reinforcement
-        if self._last_structured is not None:
-            self.cerebellum.train_step(self._last_structured.embeddings, reinforcement_strength)
 
         # Basal ganglia: record sequence for habit formation
         if self._last_structured is not None:
@@ -989,49 +1052,10 @@ class Model:
         The Hebbian traces get added to the consolidation buffer.
         """
         dmn = self._genome.dmn
-        if self.hippocampus is None or not self.hippocampus.size:
-            return
-
-        recent = self.hippocampus.peek()[:5]  # peek at top-5 recent experiences
-        if not recent:
-            return
-
-        device = get_device()
-        for _ in range(dmn.num_thoughts):
-            # Pick a recent experience and use its hidden activations as seed
-            record = recent[_ % len(recent)]
-            if not record.hebbian_traces:
-                continue
-
-            # Build a synthetic input from the record's activation pattern
-            trace = record.hebbian_traces[0]
-            hidden = torch.zeros(
-                self._genome.topology.transformer_hidden,
-                dtype=DTYPE, device=device,
-            )
-            n = min(trace.post_indices.numel(), trace.activation_strengths.numel())
-            valid = trace.post_indices[:n]
-            valid = valid[valid < hidden.shape[0]]
-            hidden[valid] = trace.activation_strengths[:valid.numel()]
-
-            # Project hidden back to embed space for cortex input
-            # Use first active region's W_in transpose as projection
-            region = self._genome.topology.active_regions[0]
-            if region in self.cortex.regions:
-                W_in = self.cortex.regions[region].W_in
-                # pseudo-inverse projection
-                thought_emb = hidden[:W_in.shape[1]] @ W_in.T  # (embed_dim,)
-                thought_emb = thought_emb.unsqueeze(0)  # (1, embed_dim)
-
-                # Run cortex read-only to generate DMN traces
-                activations = self.cortex.forward_readonly(thought_emb)
-                for r, act in activations.items():
-                    dmn_trace = self.cortex.regions[r].get_hebbian_trace()
-                    if dmn_trace is not None:
-                        # Apply DMN traces at reduced strength
-                        self.cortex.regions[r].hebbian_update(
-                            dmn_trace, dmn.association_strength,
-                        )
+        patterns = self.cortex.run_autonomous(steps=dmn.thought_steps)
+        for act_dict in patterns:
+            if len(act_dict) >= 2:
+                self.cortex.wiring.hebbian_update(act_dict, dmn.association_strength)
 
     def _consolidate(self) -> ConsolidationReport:
         records = []
@@ -1074,18 +1098,22 @@ class Model:
             {r: float(s.mean().item()) for r, s in self._ewc_scalars.items()},
         )
 
-        return self.consolidation_engine.run(
+        report = self.consolidation_engine.run(
             records=records,
             transformer=self.cortex,
             ewc_scalars=self._ewc_scalars,
             personality=self._personality,
             plasticity_rates=plasticity_rates,
             developmental_age=self._developmental_age,
+            sleep_trainer=self._sleep_replay_train_step,
         )
+        self._update_encoder_ewc()
+        return report
 
     def _save_state(self) -> None:
         state = ModelState(
             encoder_weights=self.encoder.get_weights(),
+            encoder_ewc_protection=self._encoder_ewc_scalars,
             transformer_weights=self.transformer.get_weights(),
             inter_region_weights=self.transformer.get_inter_region_weights(),
             ewc_protection=self._ewc_scalars,
@@ -1123,6 +1151,7 @@ class Model:
             return
 
         self.encoder.load_weights(state.encoder_weights)
+        self._encoder_ewc_scalars = state.encoder_ewc_protection or {}
         self.transformer.set_weights(state.transformer_weights)
         self.transformer.set_inter_region_weights(state.inter_region_weights)
         self._ewc_scalars = state.ewc_protection

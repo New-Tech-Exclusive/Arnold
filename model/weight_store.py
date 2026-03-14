@@ -46,7 +46,9 @@ class WeightStore:
                 vocab_size=topo_data.get("vocab_size", 30000),
                 embed_dim=topo_data.get("embed_dim", 64),
                 encoder_hidden=topo_data.get("encoder_hidden", 128),
+                transformer_hidden=topo_data.get("transformer_hidden", topo_data.get("cortex_hidden", 128)),
                 cortex_hidden=topo_data.get("cortex_hidden", 128),
+                memory_capacity=topo_data.get("memory_capacity", 1024),
                 hippocampus_capacity=topo_data.get("hippocampus_capacity", 1024),
             )
         except Exception:
@@ -66,6 +68,9 @@ class WeightStore:
         # Encoder weights
         for name, arr in state.encoder_weights.items():
             tensors[f"encoder_{name}"] = arr.detach().cpu()
+
+        for name, arr in state.encoder_ewc_protection.items():
+            tensors[f"encoderewc_{name}"] = arr.detach().cpu()
 
         # Transformer weights
         for region, arr in state.transformer_weights.items():
@@ -170,7 +175,9 @@ class WeightStore:
                 "vocab_size": t.vocab_size,
                 "embed_dim": t.embed_dim,
                 "encoder_hidden": t.encoder_hidden,
+                "transformer_hidden": t.transformer_hidden,
                 "cortex_hidden": t.cortex_hidden,
+                "memory_capacity": t.memory_capacity,
                 "hippocampus_capacity": t.hippocampus_capacity,
             }
 
@@ -219,6 +226,8 @@ class WeightStore:
             for key, tensor in data_items.items():
                 if key.startswith("encoder_"):
                     state.encoder_weights[key[len("encoder_"):]] = tensor
+                elif key.startswith("encoderewc_"):
+                    state.encoder_ewc_protection[key[len("encoderewc_"):]] = tensor
                 elif key.startswith("cortex_"):
                     state.transformer_weights[TransformerRegion(key[len("cortex_"):])] = tensor
                 elif key.startswith("interregion_"):

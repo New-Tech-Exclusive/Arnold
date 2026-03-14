@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import random
 import re
 import signal
 import sys
@@ -367,6 +368,8 @@ def run(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGINT, _handle_sigint)
 
     try:
+        # track repeat counts on driver text
+        _repeat_count = 0
         while turn < args.turns and not shutdown_requested:
             turn += 1
             print(f"\n── Turn {turn}/{args.turns} {'─' * (50 - len(str(turn)))}")
@@ -417,23 +420,46 @@ def run(args: argparse.Namespace) -> None:
             # ------------------------------------------------------------------
             # Step 2: Arnold trains on the teacher's corrected target text.
             # ------------------------------------------------------------------
-            result = model.process_turn(
-                training_text,
-                external_reinforcement=reinforcement_override,
-            )
+            # skip training if the teacher gave back exactly what we just sent
+            skip_training = False
+            if feedback is not None and feedback.correction.strip() == arnold_text.strip():
+                skip_training = True
+                print("  Driver │ teacher repeated same text – skipping gradient update")
+            if skip_training:
+                # Keep return type consistent (TurnResult) while avoiding
+                # additional reward amplification on repeated correction loops.
+                result = model.process_turn(
+                    training_text,
+                    external_reinforcement=0.0,
+                )
+            else:
+                result = model.process_turn(
+                    training_text,
+                    external_reinforcement=reinforcement_override,
+                )
 
             generated_text = model._detokenize(result.generated_tokens).strip()
-            if _is_usable_driver_text(generated_text):
-                arnold_text = generated_text
-            elif args.curriculum and _curr_phase < 2:
-                # Use a curriculum seed rather than feeding back the LM correction,
-                # which often contains meta-commentary ("The input is repetitive…").
-                seed_list = _CURRICULUM_SEEDS[_curr_phase]
-                arnold_text = seed_list[(turn - 1) % len(seed_list)]
-                print(f"  Curriculum │ Phase {_curr_phase} seed override")
+            repeat = generated_text == arnold_text.strip()
+            if repeat:
+                _repeat_count += 1
             else:
-                arnold_text = correction_text or training_text or "Describe one idea in a single grammatical sentence."
-                print("  Driver │ using corrected text for next turn")
+                _repeat_count = 0
+
+            if repeat or not _is_usable_driver_text(generated_text):
+                if args.curriculum and _curr_phase < 2:
+                    seed_list = _CURRICULUM_SEEDS[_curr_phase]
+                    arnold_text = seed_list[(turn - 1) % len(seed_list)]
+                    print(f"  Curriculum │ Phase {_curr_phase} seed override due to repeat")
+                else:
+                    if _repeat_count >= 3 or (not repeat and random.random() < 0.2):
+                        arnold_text = random.choice(_CURRICULUM_SEEDS[-1])
+                        print("  Driver │ injecting exploration seed")
+                    else:
+                        arnold_text = correction_text or training_text or "Describe one idea in a single grammatical sentence."
+                        print("  Driver │ using corrected text for next turn")
+            else:
+                arnold_text = generated_text
+                print("  Driver │ using generated text for next turn")
 
             # Curriculum phase advancement: track rolling coherence and advance
             # when it stays above the threshold for enough consecutive turns.
@@ -456,7 +482,7 @@ def run(args: argparse.Namespace) -> None:
             nm = result.neuromodulators
             if nm:
                 print(
-                    f"  Model │ surprise={result.surprise_score:.3f} "
+                    f"  Model │ novelty={result.novelty_score:.3f} "
                     f"reinf={result.reinforcement_strength:+.3f} "
                     f"DA={nm.dopamine:+.2f} 5HT={nm.serotonin:.2f} "
                     f"ACh={nm.acetylcholine:.2f} NE={nm.norepinephrine:.2f} "

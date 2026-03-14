@@ -178,7 +178,12 @@ class Encoder:
     def is_frozen(self) -> bool:
         return self._frozen
 
-    def online_update(self, token_ids: torch.Tensor, lr: float = 0.0001) -> None:
+    def online_update(
+        self,
+        token_ids: torch.Tensor,
+        lr: float = 0.0001,
+        ewc_scalars: dict[str, torch.Tensor] | None = None,
+    ) -> None:
         """Light Hebbian update after each conversation turn.
 
         Keeps the encoder plastic during conversation at a much lower rate
@@ -202,7 +207,11 @@ class Encoder:
         # perform updates without gradient tracking
         with torch.no_grad():
             # Co-occurrence (small update)
-            self.cooccurrence_weights += lr * (embeddings.T @ hidden) / seq_len
+            delta_co = lr * (embeddings.T @ hidden) / seq_len
+            co_protection = None if ewc_scalars is None else ewc_scalars.get("cooccurrence_weights")
+            if co_protection is not None and co_protection.ndim == 1 and co_protection.numel() == delta_co.shape[1]:
+                delta_co = delta_co * (1.0 - co_protection).unsqueeze(0)
+            self.cooccurrence_weights += delta_co
             self.cooccurrence_weights.clamp_(params.min_weight, params.max_weight)
 
             # Next-token embedding prediction
@@ -210,9 +219,13 @@ class Encoder:
                 predicted_next = syntactic[:-1] @ self.output_projection  # (seq_len-1, embed_dim)
                 actual_next    = self.token_embeddings[seq[1:].long()]     # (seq_len-1, embed_dim)
                 emb_error      = actual_next - predicted_next
+                token_protection = None if ewc_scalars is None else ewc_scalars.get("token_embeddings")
                 for pos in range(seq_len - 1):
                     tid = int(seq[pos + 1].item())
-                    self.token_embeddings[tid] += lr * emb_error[pos]
+                    token_lr = lr
+                    if token_protection is not None and tid < int(token_protection.numel()):
+                        token_lr *= float(max(0.0, 1.0 - token_protection[tid].item()))
+                    self.token_embeddings[tid] += token_lr * emb_error[pos]
                 self.token_embeddings.clamp_(params.min_weight, params.max_weight)
 
     # ------------------------------------------------------------------

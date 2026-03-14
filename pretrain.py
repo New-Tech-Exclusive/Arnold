@@ -21,6 +21,7 @@ from typing import Any, Iterator
 # Must run BEFORE `import torch` so torch cannot lazily register a broken
 # triton module that setdefault would then refuse to overwrite.
 sys.modules["triton"] = None
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
@@ -88,6 +89,7 @@ class TrainingConfig:
     # Linear warmup steps for cosine LR schedule
     warmup_steps: int = 100
     max_seq_len: int = 2048
+    gradient_max_seq_len: int = 384
 
     # Increased default sizes (~100M params target)
     embed_dim: int = 448
@@ -146,13 +148,29 @@ def tokenize(text: str, max_seq_len: int) -> torch.Tensor | None:
             toks = [min(int(t), TOKENIZER_VOCAB_LIMIT - 1) for t in toks]
         if len(toks) < 1:
             return None
-        return torch.tensor(toks, dtype=torch.long, device=get_device())
+            return torch.tensor(toks, dtype=torch.long)
 
     raw = text.encode("utf-8", errors="replace")
     if len(raw) < 4:
         return None
     ids = np.frombuffer(raw[:max_seq_len], dtype=np.uint8).astype(np.int64)
-    return torch.tensor(ids.tolist(), dtype=torch.long, device=get_device())
+    return torch.tensor(ids.tolist(), dtype=torch.long)
+
+
+def _prepare_gradient_sequence(
+    seq: torch.Tensor,
+    max_len: int,
+    step: int,
+) -> torch.Tensor:
+    """Crop long sequences for gradient tuning to keep VRAM bounded."""
+    seq = seq.detach().cpu()
+    max_len = max(8, int(max_len))
+    if int(seq.numel()) <= max_len:
+        return seq
+
+    span = int(seq.numel()) - max_len
+    start = (step * 9973) % max(span + 1, 1)
+    return seq[start:start + max_len]
 
 
 _TEXT_FIELDS = (
@@ -379,14 +397,15 @@ def pretrain(cfg: TrainingConfig) -> None:
         except Exception:
             pass  # scheduler is optional
 
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         print(
             f"  Running {cfg.gradient_steps} gradient fine-tuning steps"
             f" (batch={cfg.gradient_batch_size}, accumulate={n_accumulate},"
-            f" warmup={n_warmup}, AMP={use_amp})"
+            f" warmup={n_warmup}, AMP={use_amp}, grad_seq_len={cfg.gradient_max_seq_len})"
         )
         avg_loss: float | None = None
+        current_grad_max_len = min(cfg.gradient_max_seq_len, cfg.max_seq_len)
 
         grad_pbar = None
         if tqdm is not None:
@@ -404,22 +423,51 @@ def pretrain(cfg: TrainingConfig) -> None:
                     for j in range(cfg.gradient_batch_size)
                 ]
 
+            prepared_seqs = [
+                _prepare_gradient_sequence(seq, current_grad_max_len, i + j)
+                for j, seq in enumerate(seqs)
+            ]
+
             # --- forward + scaled backward ---
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                step_loss: torch.Tensor | None = None
-                count = 0
-                for seq in seqs:
-                    sl = model._compute_lm_loss(seq)
-                    if sl is not None:
-                        step_loss = sl if step_loss is None else step_loss + sl
-                        count += 1
+            try:
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    step_loss: torch.Tensor | None = None
+                    count = 0
+                    for seq in prepared_seqs:
+                        sl = model._compute_lm_loss(seq)
+                        if sl is not None:
+                            step_loss = sl if step_loss is None else step_loss + sl
+                            count += 1
+            except torch.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    model._optimizer.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                new_len = max(128, current_grad_max_len // 2)
+                if new_len == current_grad_max_len:
+                    raise
+                current_grad_max_len = new_len
+                if grad_pbar is not None:
+                    grad_pbar.set_postfix_str(f"oom->seq_len={current_grad_max_len}")
+                continue
             if step_loss is None or count == 0:
                 if grad_pbar is not None:
                     grad_pbar.update(1)
                 continue
             # normalise by accumulation window so effective gradient ≈ full-batch
             micro_loss = step_loss / (count * n_accumulate)
-            scaler.scale(micro_loss).backward()
+            try:
+                scaler.scale(micro_loss).backward()
+            except torch.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    model._optimizer.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                new_len = max(128, current_grad_max_len // 2)
+                if new_len == current_grad_max_len:
+                    raise
+                current_grad_max_len = new_len
+                if grad_pbar is not None:
+                    grad_pbar.set_postfix_str(f"oom->seq_len={current_grad_max_len}")
+                continue
 
             # unscaled loss for display (undo both count and accumulate division)
             loss_val = float(micro_loss.detach().item()) * n_accumulate
@@ -540,6 +588,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--gradient_steps", type=int, default=None, help="Extra gradient-based fine-tuning steps")
     g.add_argument("--gradient_lr", type=float, default=None, help="Gradient learning rate")
     g.add_argument("--gradient_batch_size", type=int, default=None, help="Gradient batch size")
+    g.add_argument("--gradient_max_seq_len", type=int, default=None, help="Max tokens per sequence during gradient fine-tuning")
     g.add_argument("--freeze_encoder", action="store_true", default=None, help="Freeze encoder during gradient tuning")
     g.add_argument("--no_amp", dest="use_amp", action="store_false", default=None, help="Disable mixed-precision (AMP) training")
     g.add_argument("--accumulation_steps", type=int, default=None, help="Gradient accumulation steps before optimizer update (default: 4)")

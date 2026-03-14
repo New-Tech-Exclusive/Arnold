@@ -208,6 +208,7 @@ class RegionActivation:
 class ModelState:
     """Everything that gets persisted between sessions (Tier 8 payload)."""
     encoder_weights: dict[str, torch.Tensor] = field(default_factory=dict)
+    encoder_ewc_protection: dict[str, torch.Tensor] = field(default_factory=dict)
     transformer_weights: dict[TransformerRegion, torch.Tensor] = field(default_factory=dict)
     inter_region_weights: dict[tuple[TransformerRegion, TransformerRegion], torch.Tensor] = field(default_factory=dict)
     ewc_protection: dict[TransformerRegion, torch.Tensor] = field(default_factory=dict)

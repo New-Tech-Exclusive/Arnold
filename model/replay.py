@@ -28,6 +28,7 @@ Plus:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 
@@ -81,6 +82,7 @@ class ReplayEngine:
         personality: PersonalityVector,
         plasticity_rates: dict[TransformerRegion, float],
         developmental_age: int,
+        sleep_trainer=None,
     ) -> ConsolidationReport:
         """Execute the full consolidation pipeline.
 
@@ -94,7 +96,13 @@ class ReplayEngine:
         report = ConsolidationReport()
 
         # Stage A: Targeted Replay (NREM 1-2)
-        self._stage_replay(records, transformer, plasticity_rates, report)
+        self._stage_replay(
+            records,
+            transformer,
+            plasticity_rates,
+            report,
+            sleep_trainer=sleep_trainer,
+        )
 
         # Stage B: Global Synaptic Downscaling (NREM 3 / Slow-wave)
         self._stage_global_downscale(transformer, report)
@@ -123,6 +131,7 @@ class ReplayEngine:
         transformer,
         plasticity_rates: dict[TransformerRegion, float],
         report: ConsolidationReport,
+        sleep_trainer=None,
     ) -> None:
         """Re-fire stored activation patterns through transformer weights.
 
@@ -164,6 +173,9 @@ class ReplayEngine:
                         continue
                     lr = plasticity_rates.get(region, 0.01) * lr_scale
                     transformer.regions[region].hebbian_update(trace, lr)
+
+                if sleep_trainer is not None and int(record.token_ids.numel()) > 1:
+                    sleep_trainer(record.token_ids, lr_scale)
 
                 report.total_replay_passes += 1
 
@@ -378,20 +390,27 @@ class ReplayEngine:
 
         max_drift = self._genome.personality.max_drift_per_cycle
         deltas: dict[str, float] = {}
+        max_interaction = max(r.interaction_number for r in records)
+        weights = torch.tensor(
+            [math.exp(-0.08 * (max_interaction - r.interaction_number)) for r in records],
+            dtype=DTYPE,
+            device=get_device(),
+        )
+        weights = weights / torch.clamp(weights.sum(), min=1e-8)
 
         # Aggregate statistics from records
         reinforcements = torch.tensor([r.reinforcement for r in records], dtype=DTYPE, device=get_device())
         novelties = torch.tensor([r.novelty_score for r in records], dtype=DTYPE, device=get_device())
         valences = torch.tensor([r.mood_at_event.valence for r in records], dtype=DTYPE, device=get_device())
 
-        mean_reinforcement = float(reinforcements.mean().item()) if int(reinforcements.numel()) > 0 else 0.0
-        mean_valence = float(valences.mean().item()) if int(valences.numel()) > 0 else 0.0
+        mean_reinforcement = float(torch.sum(reinforcements * weights).item()) if int(reinforcements.numel()) > 0 else 0.0
+        mean_valence = float(torch.sum(valences * weights).item()) if int(valences.numel()) > 0 else 0.0
 
         def _clamp01(v: float) -> float:
             return float(max(min(v, 1.0), 0.0))
 
         # Curiosity: high surprise + positive reinforcement
-        surprise_pos = float(torch.mean(novelties * torch.clamp(reinforcements, min=0)).item())
+        surprise_pos = float(torch.sum(novelties * torch.clamp(reinforcements, min=0) * weights).item())
         delta_curiosity = max(min(surprise_pos * 0.1, max_drift), -max_drift)
         personality.curiosity = _clamp01(personality.curiosity + delta_curiosity)
         deltas["curiosity"] = delta_curiosity
@@ -409,7 +428,9 @@ class ReplayEngine:
         # Creativity: surprise-heavy responses that got positive signal
         high_surprise_mask = novelties > 0.5
         if bool(high_surprise_mask.any()):
-            creative_signal = float(reinforcements[high_surprise_mask].mean().item())
+            masked_weights = weights[high_surprise_mask]
+            masked_weights = masked_weights / torch.clamp(masked_weights.sum(), min=1e-8)
+            creative_signal = float(torch.sum(reinforcements[high_surprise_mask] * masked_weights).item())
         else:
             creative_signal = 0.0
         delta_creative = max(min(creative_signal * 0.05, max_drift), -max_drift)
@@ -418,14 +439,14 @@ class ReplayEngine:
 
         # Caution: qualified outputs working better than confident ones
         # Proxy: negative reinforcement episodes → caution up
-        neg_ratio = float((reinforcements < 0).sum().item()) / max(int(reinforcements.numel()), 1)
+        neg_ratio = float(weights[reinforcements < 0].sum().item()) if int(reinforcements.numel()) > 0 else 0.0
         delta_caution = max(min((neg_ratio - 0.3) * 0.05, max_drift), -max_drift)
         personality.caution = _clamp01(personality.caution + delta_caution)
         deltas["caution"] = delta_caution
 
         # Humor: tonal lightness positively received (proxy: high valence + low arousal)
         arousal = torch.tensor([r.mood_at_event.arousal for r in records], dtype=DTYPE, device=get_device())
-        low_arousal_pos = float(torch.mean(valences * (1.0 - arousal)).item())
+        low_arousal_pos = float(torch.sum(valences * (1.0 - arousal) * weights).item())
         delta_humor = max(min(low_arousal_pos * 0.04, max_drift), -max_drift)
         personality.humor = _clamp01(personality.humor + delta_humor)
         deltas["humor"] = delta_humor

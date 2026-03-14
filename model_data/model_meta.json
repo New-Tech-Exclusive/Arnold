@@ -42,7 +42,9 @@
     "vocab_size": 256,
     "embed_dim": 32,
     "encoder_hidden": 64,
+    "transformer_hidden": 96,
     "cortex_hidden": 128,
+    "memory_capacity": 1024,
     "hippocampus_capacity": 1024
   }
 }

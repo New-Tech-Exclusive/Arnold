@@ -138,6 +138,7 @@ class Decoder:
         initial_logits: torch.Tensor,
         mood: MoodState,
         surprise_score: float,
+        personality: PersonalityVector,
         max_tokens: int = 64,
         eos_token: int | None = None,
         encoder=None,
@@ -223,9 +224,23 @@ class Decoder:
             # --- Update recurrent hidden state ---
             if encoder is not None:
                 emb = encoder.token_embeddings[token].to(device)  # (embed_dim,)
+
+                # --- Compute cortex-like activation (match transformer forward) ---
                 if primary_region is not None:
-                    co_hidden = torch.relu(emb @ primary_region.W_in.to(device))
-                    co_hidden = torch.relu(co_hidden @ primary_region.W_hidden.to(device))
+                    pre = torch.relu(emb @ primary_region.W_in.to(device))
+                    post = torch.relu(pre @ primary_region.W_hidden.to(device))
+                    post = post * primary_region._gain
+                    if primary_region._k < post.shape[-1]:
+                        topk_vals, topk_idx = torch.topk(post, primary_region._k)
+                        sparse = torch.zeros_like(post)
+                        sparse[topk_idx] = topk_vals
+                        post = sparse
+                    co_hidden = torch.layer_norm(
+                        post,
+                        [post.shape[-1]],
+                        primary_region._ln_scale.to(device),
+                        primary_region._ln_bias.to(device),
+                    )
                 else:
                     co_hidden = torch.relu(emb @ encoder.cooccurrence_weights.to(device))
 

@@ -22,9 +22,8 @@ class SurpriseDetector:
         self._params = genome.surprise
         # Running EMA of raw prediction errors — prevents surprise saturating at 1.0
         # when untrained weights produce uniformly large errors.
-        self._error_ema: dict[TransformerRegion, float] = {
-            region: 2.0 for region in genome.topology.active_regions
-        }
+        # EMA baseline for raw prediction error; starts empty and seeds on first pass
+        self._error_ema: dict[TransformerRegion, float] = {}
 
     def score(
         self,
@@ -63,7 +62,13 @@ class SurpriseDetector:
             # errors) don't saturate surprise at 1.0 and pin NE at max forever.
             raw_err = max(act.prediction_error, 0.0)
             raw_errors[region] = raw_err
-            normalized_err = raw_err / (self._error_ema.get(region, 2.0) + 1e-6)
+
+            # If this is the first time we see this region, initialise EMA
+            if region not in self._error_ema:
+                self._error_ema[region] = max(raw_err, 1.0)
+                normalized_err = 0.5
+            else:
+                normalized_err = raw_err / (self._error_ema[region] + 1e-6)
             err_confidence = float(math.exp(-normalized_err))
 
             # --- Logit-based confidence (grows meaningful as W_out trains) ---

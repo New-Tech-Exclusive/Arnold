@@ -66,7 +66,7 @@ def print_status(model: Model, label: str = "") -> None:
     for region, rate in plast["per_region_plasticity"].items():
         print(f"    {region:10s} {rate:.6f}")
 
-    print(f"\n  Memory: {status['memory_utilization']:.1%} full")
+    print(f"\n  Memory: {status['hippocampus_utilization']:.1%} full")
     print(f"  Consolidations: {status['consolidation_meta'].get('total_consolidations', 0)}")
 
     highways = status.get("inter_region_highways", {})

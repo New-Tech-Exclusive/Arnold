@@ -166,6 +166,7 @@ class ReplayEngine:
             )
             n_replays = max(1, n_replays)
 
+            grad_trained = False
             for _ in range(n_replays):
                 for trace in record.hebbian_traces:
                     region = trace.region
@@ -174,10 +175,11 @@ class ReplayEngine:
                     lr = plasticity_rates.get(region, 0.01) * lr_scale
                     transformer.regions[region].hebbian_update(trace, lr)
 
-                if sleep_trainer is not None and int(record.token_ids.numel()) > 1:
-                    sleep_trainer(record.token_ids, lr_scale)
-
                 report.total_replay_passes += 1
+
+            # Run a single gradient replay step per record (not per pass)
+            if sleep_trainer is not None and int(record.token_ids.numel()) > 1:
+                sleep_trainer(record.token_ids, lr_scale)
 
             report.records_replayed += 1
 

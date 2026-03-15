@@ -148,7 +148,7 @@ def tokenize(text: str, max_seq_len: int) -> torch.Tensor | None:
             toks = [min(int(t), TOKENIZER_VOCAB_LIMIT - 1) for t in toks]
         if len(toks) < 1:
             return None
-            return torch.tensor(toks, dtype=torch.long)
+        return torch.tensor(toks, dtype=torch.long)
 
     raw = text.encode("utf-8", errors="replace")
     if len(raw) < 4:
@@ -375,6 +375,7 @@ def pretrain(cfg: TrainingConfig) -> None:
     model.birth(pretraining_corpus=sequences)
 
     # optional gradient-based tuning: run a few supervised passes on the corpus
+    avg_loss: float | None = None
     if cfg.gradient_steps > 0 and model._optimizer is not None:
         if cfg.freeze_encoder:
             model.encoder.freeze()
@@ -585,7 +586,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--steps", type=int, default=None, help="Hebbian update steps")
     g.add_argument("--lr", type=float, default=None, help="Hebbian learning rate")
     g.add_argument("--max_seq_len", type=int, default=None, help="Max tokens per sequence")
-    g.add_argument("--gradient_steps", type=int, default=None, help="Extra gradient-based fine-tuning steps")
+    g.add_argument("--gradient_steps", type=int, default=1000, help="Extra gradient-based fine-tuning steps")
     g.add_argument("--gradient_lr", type=float, default=None, help="Gradient learning rate")
     g.add_argument("--gradient_batch_size", type=int, default=None, help="Gradient batch size")
     g.add_argument("--gradient_max_seq_len", type=int, default=None, help="Max tokens per sequence during gradient fine-tuning")

@@ -274,7 +274,11 @@ async def generate_sse(req: ChatRequest) -> AsyncGenerator[str, None]:
                     primary_region = model.transformer.regions[region]
                     break
 
-            hidden_dim = primary_region.hidden_dim if primary_region is not None else bs.cooccurrence_weights.shape[1]
+            # Use transformer hidden size (not encoder hidden) for the recurrent state
+            if primary_region is not None:
+                hidden_dim = primary_region.hidden_dim
+            else:
+                hidden_dim = model._genome.topology.transformer_hidden
             hidden_state = torch.zeros(hidden_dim, dtype=current_logits.dtype)
             ctx_buf: deque[torch.Tensor] = deque(maxlen=gen_params.context_buffer_size)
 

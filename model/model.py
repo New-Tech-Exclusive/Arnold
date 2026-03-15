@@ -549,7 +549,13 @@ class Model:
         logits = self._compute_lm_logits(token_ids)
         if logits.numel() == 0:
             return None
-        targets = token_ids[1: logits.shape[0] + 1].to(device=logits.device)
+
+        # Append EOS token to targets if available and not already present
+        token_ids_use = token_ids
+        eos_id = getattr(self._tokenizer, "eos_token_id", None)
+        if eos_id is not None and int(token_ids_use[-1].item()) != eos_id:
+            token_ids_use = torch.cat([token_ids_use, torch.tensor([eos_id], dtype=torch.long, device=token_ids_use.device)])
+        targets = token_ids_use[1: logits.shape[0] + 1].to(device=logits.device)
         return F.cross_entropy(logits, targets, label_smoothing=grad_cfg.label_smoothing)
 
     def _sleep_replay_train_step(self, token_ids: torch.Tensor, replay_scale: float = 1.0) -> float | None:
@@ -784,7 +790,9 @@ class Model:
                 combined_logits,
                 self.limbic.mood,
                 novelty_score,
+                self._personality,
                 max_tokens=_max_tokens,
+                eos_token=getattr(self._tokenizer, "eos_token_id", None) if self._tokenizer is not None else None,
                 encoder=self.encoder,
                 transformer=self.cortex,
                 anchor_embeddings=structured.embeddings,
